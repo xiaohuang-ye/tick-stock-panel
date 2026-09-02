@@ -40,24 +40,28 @@ async function loadSDK() {
   // 候选 node_modules 目录（按优先级）
   const nmDirs = [path.join(scriptDir, 'node_modules')]
   for (const p of (process.env.NODE_PATH || '').split(path.delimiter).filter(Boolean)) nmDirs.push(p)
-  try {
-    const groot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
-    if (groot) nmDirs.push(groot)
-  } catch {
-    /* npm 不可用则忽略 */
-  }
   let entry
-  for (const nm of nmDirs) {
+  for (const p of nmDirs) {
     try {
-      entry = require.resolve(path.join(nm, 'stock-sdk'))
+      entry = require.resolve(path.join(p, 'stock-sdk'))
       break
     } catch {
       /* 试下一个 */
     }
   }
   if (!entry) {
+    // 本地与 NODE_PATH 都没有才查全局。execSync('npm root -g') 每次 1-2s,
+    // 全市场同步会 spawn 上百个桥接进程, vendored 部署时不该付出这笔开销。
+    try {
+      const groot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+      if (groot) entry = require.resolve(path.join(groot, 'stock-sdk'))
+    } catch {
+      /* npm 不可用则忽略 */
+    }
+  }
+  if (!entry) {
     throw new Error(
-      `无法解析 stock-sdk（已搜索: ${nmDirs.join(', ')}）。请在桥接目录 npm install，或全局 npm i -g stock-sdk。`
+      `无法解析 stock-sdk（已搜索: ${nmDirs.join(', ')} 与全局 npm root）。请在桥接目录 npm install，或全局 npm i -g stock-sdk。`
     )
   }
   const mod = await import(pathToFileURL(entry).href)

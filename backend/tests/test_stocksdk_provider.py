@@ -9,6 +9,8 @@ import datetime as dt
 import json
 import shutil
 import subprocess
+import threading
+import time
 
 import polars as pl
 
@@ -117,6 +119,94 @@ def test_bridge_error_degrades_to_empty(monkeypatch):
     assert StockSDKProvider().get_daily(["600519.SH"], None, None).is_empty()
     assert StockSDKProvider().get_realtime() == []
     assert StockSDKProvider().get_instruments("stock") == []
+
+
+def _daily_payload(job):
+    rows = {
+        s: [{"date": "2026-01-05", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+             "volume": 1, "amount": 1.0, "code": s.split(".")[0]}]
+        for s in job["symbols"]
+    }
+    return {"ok": True, "op": "daily", "rows": rows}
+
+
+def test_get_daily_runs_two_bridges_in_parallel(monkeypatch):
+    """两个批次的桥接子进程应同时在飞, 且 concurrency 透传给 bridge.mjs。"""
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 2)]
+    state = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+    seen_concurrency = []
+
+    def fake(job, timeout=None):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            seen_concurrency.append(job.get("concurrency"))
+        time.sleep(0.2)
+        with lock:
+            state["active"] -= 1
+        return _daily_payload(job)
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    df = StockSDKProvider().get_daily(syms, None, None)
+
+    assert df.height == sp._BATCH * 2
+    assert state["max_active"] == sp._PARALLEL_BRIDGE
+    assert seen_concurrency == [sp._CONCURRENCY] * 2
+
+
+def test_on_chunk_done_counts_each_chunk_once(monkeypatch):
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 3)]
+    calls = []
+
+    def fake(job, timeout=None):
+        time.sleep(0.02)
+        return _daily_payload(job)
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    df = StockSDKProvider().get_daily(syms, None, None, on_chunk_done=lambda i, n: calls.append((i, n)))
+
+    assert df.height == sp._BATCH * 3
+    total = sp._BATCH * 3 // sp._BATCH
+    assert sorted(calls) == [(i, total) for i in range(1, total + 1)]
+    # 并行下进度必须单调递增, 不能出现 2 先于 1 的乱序回调
+    assert calls == sorted(calls)
+
+
+def test_chunk_failure_does_not_kill_other_chunks(monkeypatch):
+    """单批桥接失败只跳过该批, 其余批次照常落库。"""
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 2)]
+
+    def fake(job, timeout=None):
+        if "600000.SH" in job["symbols"]:
+            raise sp.bridge.StockSDKBridgeError("boom")
+        return _daily_payload(job)
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    df = StockSDKProvider().get_daily(syms, None, None)
+
+    assert df.height == sp._BATCH
+    assert "600000.SH" not in df["symbol"].unique().to_list()
+
+
+def test_adj_factors_drop_insane_ex_factor(monkeypatch):
+    """1e26 级脏因子(实测会导致 enriched strict_cast 崩溃)必须在 provider 边界丢弃。"""
+    _patch_run_job(monkeypatch, {
+        "adj": {"ok": True, "op": "adj", "rows": {
+            "600519.SH": [
+                {"symbol": "600519.SH", "trade_date": "2020-01-02", "ex_factor": 5.29},
+                {"symbol": "600519.SH", "trade_date": "2020-01-03", "ex_factor": 1.9515e26},
+                {"symbol": "600519.SH", "trade_date": "2020-01-04", "ex_factor": 0},
+                {"symbol": "600519.SH", "trade_date": "2020-01-05", "ex_factor": None},
+                {"symbol": "600519.SH", "trade_date": "2020-01-06", "ex_factor": -1.0},
+            ],
+        }},
+    })
+    df = StockSDKProvider().get_adj_factors(["600519.SH"], None, None)
+
+    assert df.height == 1
+    assert df["trade_date"][0] == dt.date(2020, 1, 2)
+    assert abs(df["ex_factor"][0] - 5.29) < 1e-9
 
 
 def test_bridge_uses_utf8_error_tolerant_subprocess(monkeypatch):
