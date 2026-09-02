@@ -10,7 +10,7 @@ import type { KlineRow, LevelSeries } from '@/lib/api'
  * 与 StockDailyKChart/EChartsCandlestick 刻意不复用:
  *   - 那套图表面向「行情浏览」,强调全套指标副图(MA/MACD/KDJ/BOLL)、涨停标记等;
  *   - 本图表面向「分析决策」,核心是【关键价位】(压力/支撑/密集区/枢轴/前高前低),
- *     通过开关按钮控制各价位组的显隐,布局更简洁(主图 + 成交量即可)。
+ *     通过开关按钮控制各价位组的显隐,布局更简洁(主图 MA均线/通道曲线 + 成交量)。
  *
  * 预留接口(类型已定义,渲染逻辑留 hook,后续实现):
  *   - markers: 日期标记点(新闻/暴雷/利好 → markPoint)
@@ -31,7 +31,7 @@ const THEME = {
 const CT = () => chartTheme(getTheme())
 
 // ===== 价位类型(与后端 levels.py 的 LEVEL_TYPES 对齐) =====
-export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round'
+export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round' | 'ma'
 
 export interface PriceLevel {
   value: number
@@ -56,6 +56,7 @@ export const LEVEL_GROUPS: { key: LevelType; label: string; color: string }[] = 
   { key: 'gap',      label: '缺口位',    color: '#EC4899' },   // 粉
   { key: 'fib',      label: '斐波那契',  color: '#F59E0B' },   // 金
   { key: 'round',    label: '整数关口',  color: '#71717A' },   // 灰(心理位,弱视觉)
+  { key: 'ma',       label: 'MA均线',    color: '#3B82F6' },   // 蓝(MA5/10/20/60 前端SMA曲线)
 ]
 
 // 通道曲线元数据(单一数据源):供 buildOption 画线 + 右侧面板取最新值共用。
@@ -74,6 +75,15 @@ const CURVE_DEFS: { alignedKey: string; group: LevelType; endLabel: string; colo
   { alignedKey: 'keltner_l_lower',group: 'keltner_l', endLabel: 'Keltner长下', color: '#67E8F9', dashed: true },
   { alignedKey: 'atr_stop',       group: 'atr_stop',  endLabel: 'ATR下轨', color: '#EF4444', dashed: true },
   { alignedKey: 'atr_tp',         group: 'atr_stop',  endLabel: 'ATR上轨', color: '#F87171', dashed: true },
+]
+
+// MA 均线元数据: 前端由收盘价 SMA 直接计算(不经后端 levels 接口),配色对齐行情页 EChartsCandlestick。
+// 开关组固定为 'ma',一次控制全部周期。
+const MA_DEFS: { key: string; label: string; color: string; period: number }[] = [
+  { key: 'ma5',  label: 'MA5',  color: '#A1A1AA', period: 5 },
+  { key: 'ma10', label: 'MA10', color: '#3B82F6', period: 10 },
+  { key: 'ma20', label: 'MA20', color: '#F97316', period: 20 },
+  { key: 'ma60', label: 'MA60', color: '#8B5CF6', period: 60 },
 ]
 
 // ===== 预留:标记 / 区间(后续新闻面、事件区间用) =====
@@ -116,7 +126,7 @@ export function AnalysisKChart({
   levels,
   series,
   seriesDates,
-  defaultLevelTypes = ['sr', 'pivot', 'keltner_s'],
+  defaultLevelTypes = ['sr', 'pivot', 'keltner_s', 'ma'],
   markers,
   ranges,
   onDateClick,
@@ -136,7 +146,7 @@ export function AnalysisKChart({
   const [hoveredKey, setHoveredKey] = useState<string | null>(null)
 
   // 数据预处理 + 带状曲线序列对齐(后端 series 的日期范围可能与 rows 不同,需映射)
-  const { dates, candle, vols, dateIndex, zoomStart, alignedSeries } = useMemo(() => {
+  const { dates, candle, vols, dateIndex, zoomStart, alignedSeries, maSeries } = useMemo(() => {
     const dates = rows.map(r => (typeof r.date === 'string' ? r.date.slice(0, 10) : String(r.date)))
     const candle = rows.map(r => [r.open, r.close, r.low, r.high])
     const vols = rows.map(r => ({
@@ -184,7 +194,12 @@ export function AnalysisKChart({
       }
     }
 
-    return { dates, candle, vols, dateIndex, zoomStart, alignedSeries }
+    // MA 均线序列: 前端按收盘价 SMA 计算,不足周期的前段为 null
+    const closes = rows.map(r => r.close)
+    const maSeries: Record<string, (number | null)[]> = {}
+    for (const def of MA_DEFS) maSeries[def.key] = sma(closes, def.period)
+
+    return { dates, candle, vols, dateIndex, zoomStart, alignedSeries, maSeries }
   }, [rows, series, seriesDates])
 
   // 构建 option
@@ -309,9 +324,44 @@ export function AnalysisKChart({
       })
     }
 
+    // MA 均线(前端 SMA 计算) —— 实线曲线,与通道曲线同款式:右侧 endLabel 显示「MA20 12.34」,
+    // hover 命中整组高亮(keyMap 统一映射到 'ma')
+    if (activeTypes.has('ma')) {
+      for (const def of MA_DEFS) {
+        const data = maSeries[def.key]
+        if (!data || !data.some(v => v != null)) continue
+        let lastVal: number | null = null
+        for (let i = data.length - 1; i >= 0; i--) {
+          if (data[i] != null) { lastVal = data[i]; break }
+        }
+        const hit = hoveredKey === 'ma'
+        const opacity = dimming ? (hit ? 1 : 0.12) : 0.9
+        const width = hit ? 1.8 : 1
+        series.push({
+          name: def.label, type: 'line', data: data.map(v => v ?? '-'),
+          symbol: 'none', silent: false, animation: false,
+          z: 1,
+          zlevel: hit ? 10 : 0,
+          lineStyle: { width, color: def.color, type: 'solid', opacity },
+          itemStyle: { color: def.color },
+          endLabel: lastVal != null ? {
+            show: true,
+            formatter: () => `${def.label} ${lastVal!.toFixed(2)}`,
+            color: def.color, fontSize: hit ? 10 : 9, fontFamily: 'JetBrains Mono, monospace',
+            fontWeight: hit ? 'bold' : 'normal',
+            backgroundColor: hit ? CT().tooltipBg : CT().infoBarBg,
+            borderColor: hit ? def.color : 'transparent',
+            borderWidth: hit ? 1 : 0,
+            padding: [2, 5], borderRadius: 2,
+            distance: 6,
+          } : undefined,
+        })
+      }
+    }
+
     // 填充 seriesIndex → levelKey 映射(K/成交量索引 0/1 不参与联动)
     const keyMap = new Map<number, string>()
-    // series[0]=K线, series[1]=成交量, 之后是按 priceLines + CURVE_DEFS 顺序 push 的
+    // series[0]=K线, series[1]=成交量, 之后是按 priceLines + CURVE_DEFS + MA_DEFS 顺序 push 的
     let si = 2
     for (const p of priceLines) {
       keyMap.set(si++, levelKey(p.type, p.value))
@@ -321,6 +371,13 @@ export function AnalysisKChart({
       const data = alignedSeries[def.alignedKey]
       if (!data || !data.some(v => v != null)) continue
       keyMap.set(si++, def.group)
+    }
+    if (activeTypes.has('ma')) {
+      for (const def of MA_DEFS) {
+        const data = maSeries[def.key]
+        if (!data || !data.some(v => v != null)) continue
+        keyMap.set(si++, 'ma')
+      }
     }
     seriesKeyMapRef.current = keyMap
 
@@ -419,16 +476,18 @@ export function AnalysisKChart({
           <span className="text-[10px] text-muted mr-1">关键价位</span>
           {LEVEL_GROUPS.map(g => {
             const active = activeTypes.has(g.key)
-            // 枢轴点数量按当前档位过滤显示;其他组显示原始数量
+            // 枢轴点数量按当前档位过滤显示;MA 组无后端点位,数量 = 有数据的均线周期条数;其他组显示原始数量
             const raw = levels[g.key] ?? []
-            const count = g.key === 'pivot'
-              ? raw.filter(p => p.rank === undefined || p.rank <= pivotRank).length
-              : raw.length
+            const count = g.key === 'ma'
+              ? MA_DEFS.filter(d => maSeries[d.key]?.some(v => v != null)).length
+              : g.key === 'pivot'
+                ? raw.filter(p => p.rank === undefined || p.rank <= pivotRank).length
+                : raw.length
             return (
               <button
                 key={g.key}
                 onClick={() => toggleType(g.key)}
-                disabled={raw.length === 0}
+                disabled={count === 0}
                 title={`${g.label} (${count} 个)`}
                 className={`inline-flex items-center gap-1 h-6 px-2 rounded-md text-[10px] font-medium border transition-all disabled:opacity-30 disabled:cursor-not-allowed ${
                   active
@@ -619,4 +678,16 @@ function fmtVol(v: number): string {
   if (v >= 1e8) return (v / 1e8).toFixed(2) + '亿'
   if (v >= 1e4) return (v / 1e4).toFixed(0) + '万'
   return v.toFixed(0)
+}
+
+/** 简单移动平均(SMA of close),滑动求和 O(n);不足 period 的前段为 null。 */
+function sma(closes: number[], period: number): (number | null)[] {
+  const out: (number | null)[] = new Array(closes.length).fill(null)
+  let sum = 0
+  for (let i = 0; i < closes.length; i++) {
+    sum += closes[i]
+    if (i >= period) sum -= closes[i - period]
+    if (i >= period - 1) out[i] = sum / period
+  }
+  return out
 }

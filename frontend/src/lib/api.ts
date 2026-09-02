@@ -146,7 +146,7 @@ export interface AiFinancialReport {
 }
 
 // ===== 个股分析 =====
-export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round'
+export type LevelType = 'sr' | 'pivot' | 'extreme' | 'boll' | 'keltner_s' | 'keltner_m' | 'keltner_l' | 'atr_stop' | 'gap' | 'fib' | 'round' | 'ma'
 
 export interface PriceLevel {
   value: number
