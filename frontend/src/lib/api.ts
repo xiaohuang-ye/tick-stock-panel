@@ -1629,7 +1629,7 @@ export const api = {
       body: JSON.stringify({ provider, dataset, symbols, config }),
     }),
   updateDataProviders: (cfg: Partial<Pick<Preferences, 'daily_data_provider' | 'adj_factor_provider' | 'minute_data_provider' | 'realtime_data_provider' | 'financial_data_provider'>>) =>
-    request<Pick<Preferences, 'daily_data_provider' | 'adj_factor_provider' | 'minute_data_provider' | 'realtime_data_provider'>>(
+    request<Pick<Preferences, 'daily_data_provider' | 'adj_factor_provider' | 'minute_data_provider' | 'realtime_data_provider' | 'financial_data_provider'>>(
       '/api/settings/preferences/data-providers',
       { method: 'PUT', body: JSON.stringify(cfg) },
     ),

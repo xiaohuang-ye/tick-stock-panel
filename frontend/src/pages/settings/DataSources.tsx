@@ -5,6 +5,7 @@ import { Check, Database, Eye, EyeOff, KeyRound, Plus, RefreshCw, Zap, FileWarni
 import { api, type DataSourceItem, type PluginDataSourceItem } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { useCapabilities, usePreferences } from '@/lib/useSharedQueries'
+import { FINANCIAL_QK } from '@/lib/useFinancials'
 import { TIER_RANK, tierRank, tierStyle } from '@/lib/capability-labels'
 import { toast } from '@/components/Toast'
 import { DataSourceEditor } from './DataSourceEditor'
@@ -18,24 +19,25 @@ const DATASET_LABEL: Record<string, string> = {
   financial: '财务',
 }
 
-/** 数据集 → 路由偏好字段 + 默认值 + 展示标签 (financial 无后端路由消费方, 仅展示不参与切换) */
 /** 能力卡片定义: 数据集 + 说明 (路由选择嵌入每张卡片) */
 const CAPABILITY_CARDS = [
   { dataset: 'daily', label: '日K', desc: '历史 + 实时覆写' },
   { dataset: 'adj_factor', label: '除权因子', desc: '复权计算' },
   { dataset: 'realtime', label: '实时行情', desc: '全市场快照' },
   { dataset: 'minute', label: '分钟K', desc: '分时图 · 回测' },
+  { dataset: 'financial', label: '财务', desc: '财务报表 · 财务因子' },
 ] as const
 
-/** 数据集 → 路由偏好字段 + 默认值 (financial 无后端路由消费方, 仅展示) */
+/** 数据集 → 路由偏好字段 + 默认值 (financial 消费方: financial_sync 同步 + 财务分析页) */
 const DATASET_ROUTE: Record<string, {
-  field: 'daily_data_provider' | 'adj_factor_provider' | 'minute_data_provider' | 'realtime_data_provider'
+  field: 'daily_data_provider' | 'adj_factor_provider' | 'minute_data_provider' | 'realtime_data_provider' | 'financial_data_provider'
   def: string
 }> = {
   daily: { field: 'daily_data_provider', def: 'tickflow' },
   adj_factor: { field: 'adj_factor_provider', def: 'same_as_daily' },
   minute: { field: 'minute_data_provider', def: 'tickflow' },
   realtime: { field: 'realtime_data_provider', def: 'tickflow' },
+  financial: { field: 'financial_data_provider', def: 'tickflow' },
 }
 
 /** 各能力在 TickFlow 需要的最低订阅档位 (对照 tiers.yaml: 日K 全档位可用,
@@ -421,7 +423,7 @@ export function SettingsDataSourcesPanel() {
         adj_factor_provider: pick('adj_factor'),
         realtime_data_provider: pick('realtime'),
         minute_data_provider: pick('minute'),
-        financial_data_provider: 'tickflow',
+        financial_data_provider: pick('financial'),
       })
     },
     onSuccess: () => {
@@ -500,6 +502,7 @@ export function SettingsDataSourcesPanel() {
     adj_factor: adjPref === 'same_as_daily' ? dailyPref : adjPref,
     minute: prefs.data?.minute_data_provider || 'tickflow',
     realtime: prefs.data?.realtime_data_provider || 'tickflow',
+    financial: prefs.data?.financial_data_provider || 'tickflow',
   }
   const servingDatasets = (name: string) =>
     Object.entries(effProvider).filter(([, v]) => v === name).map(([k]) => k)
@@ -515,6 +518,8 @@ export function SettingsDataSourcesPanel() {
     qc.invalidateQueries({ queryKey: QK.preferences })
     qc.invalidateQueries({ queryKey: QK.capabilities })
     qc.invalidateQueries({ queryKey: QK.quoteStatus })
+    // 财务状态(staleTime 60s)依赖当前 financial provider, 切换后财务分析页须立即解锁
+    qc.invalidateQueries({ queryKey: FINANCIAL_QK.status })
   }
 
   // 单个能力的提供方切换: 点标签即刻生效 (same_as_daily 仅除权有效 = 跟随日K)
@@ -539,6 +544,7 @@ export function SettingsDataSourcesPanel() {
       adj_factor_provider: 'same_as_daily',
       minute_data_provider: 'tickflow',
       realtime_data_provider: 'tickflow',
+      financial_data_provider: 'tickflow',
     }),
     onSuccess: () => {
       invalidateRouting()
@@ -567,6 +573,7 @@ export function SettingsDataSourcesPanel() {
       case 'adj_factor': return adjPref
       case 'minute': return prefs.data?.minute_data_provider || 'tickflow'
       case 'realtime': return prefs.data?.realtime_data_provider || 'tickflow'
+      case 'financial': return prefs.data?.financial_data_provider || 'tickflow'
       default: return 'tickflow'
     }
   }
