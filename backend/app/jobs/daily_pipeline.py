@@ -19,6 +19,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from app.data_providers.base import UpstreamThrottledError
 from app.indicators.pipeline import run_pipeline
 from app.config import settings
 from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
@@ -323,19 +324,26 @@ def run_now(
         def _adj_chunk_progress(cur: int, tot: int) -> None:
             emit("sync_adj", 50 + int(10 * cur / tot),
                  f"除权因子批次 {cur}/{tot}", stage_pct=int(100 * cur / tot), skip_log=True)
-        written_adj, affected_symbols = kline_sync.sync_adj_factor(
-            universe, repo, capset,
-            start_time=adj_start, end_time=adj_end,
-            on_chunk_done=_adj_chunk_progress,
-        )
-        if affected_symbols:
-            _refresh_single_view(repo, "adj_factor")
-            emit("sync_adj", 60, f"除权因子完成,新增 {len(affected_symbols)} 只个股")
-            logger.info("sync_adj: [%s ~ %s] done, %d symbols", adj_start_str, adj_end_str, len(affected_symbols))
+        try:
+            written_adj, affected_symbols = kline_sync.sync_adj_factor(
+                universe, repo, capset,
+                start_time=adj_start, end_time=adj_end,
+                on_chunk_done=_adj_chunk_progress,
+            )
+        except UpstreamThrottledError as e:
+            # 限流中止: 数据保持既有状态, 日K已落库, 管道继续而非整轮失败。
+            stage_errors.append(f"sync_adj: {e}")
+            logger.warning("sync_adj: [%s ~ %s] throttled-abort: %s", adj_start_str, adj_end_str, e)
+            emit("sync_adj", 60, "除权因子被上游限流,本轮中止拉取(数据保持既有),稍后重试")
         else:
-            emit("sync_adj", 60, "除权因子完成,无新增")
-            logger.info("sync_adj: [%s ~ %s] no new factors", adj_start_str, adj_end_str)
-        _invalidate("adj_factor")
+            if affected_symbols:
+                _refresh_single_view(repo, "adj_factor")
+                emit("sync_adj", 60, f"除权因子完成,新增 {len(affected_symbols)} 只个股")
+                logger.info("sync_adj: [%s ~ %s] done, %d symbols", adj_start_str, adj_end_str, len(affected_symbols))
+            else:
+                emit("sync_adj", 60, "除权因子完成,无新增")
+                logger.info("sync_adj: [%s ~ %s] no new factors", adj_start_str, adj_end_str)
+            _invalidate("adj_factor")
     else:
         skipped.append("sync_adj")
         logger.info("sync_adj skipped: no ADJ_FACTOR capability")
@@ -708,15 +716,21 @@ def run_symbols_sync(
     written_adj, affected_symbols = 0, []
     if capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow":
         emit("sync_adj", 45, "获取除权因子…")
-        written_adj, affected_symbols = kline_sync.sync_adj_factor(
-            symbols, repo, capset,
-            start_time=_dt.combine(start_date, _dt.min.time()),
-            end_time=_dt.now(),
-        )
-        if affected_symbols:
-            _refresh_single_view(repo, "adj_factor")
-        emit("sync_adj", 55, f"除权因子完成,{written_adj} 行")
-        _invalidate("adj_factor")
+        try:
+            written_adj, affected_symbols = kline_sync.sync_adj_factor(
+                symbols, repo, capset,
+                start_time=_dt.combine(start_date, _dt.min.time()),
+                end_time=_dt.now(),
+            )
+        except UpstreamThrottledError as e:
+            skipped.append(f"sync_adj(限流中止: {e})")
+            logger.warning("sync_symbols: sync_adj throttled-abort: %s", e)
+            emit("sync_adj", 55, "除权因子被上游限流,本轮跳过(数据保持既有),稍后重试")
+        else:
+            if affected_symbols:
+                _refresh_single_view(repo, "adj_factor")
+            emit("sync_adj", 55, f"除权因子完成,{written_adj} 行")
+            _invalidate("adj_factor")
     else:
         skipped.append("sync_adj")
         logger.info("sync_symbols: sync_adj skipped (no ADJ_FACTOR capability)")

@@ -13,6 +13,7 @@ import threading
 import time
 
 import polars as pl
+import pytest
 
 from app.plugins.stocksdk import bridge
 from app.plugins.stocksdk import provider as sp
@@ -316,3 +317,121 @@ def test_builtin_not_editable():
             raise AssertionError("expected ValueError for builtin")
         except ValueError:
             pass
+
+
+# ===== 除权 none 基线复用 + 空结果熔断 =====
+
+
+@pytest.fixture(autouse=True)
+def _clean_none_close_cache():
+    """基线缓存是模块级单例, 逐用例清空, 用例顺序不得影响行为。"""
+    sp._none_close_cache.clear()
+    yield
+    sp._none_close_cache.clear()
+
+
+def test_adj_reuses_daily_none_baseline_hfq_only(monkeypatch):
+    """与最近一次 get_daily 同窗口的除权拉取只发 hfq 请求, ex_factor 本地合成。"""
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        if job["op"] == "daily" and job.get("adjust") == "none":
+            return {"ok": True, "op": "daily", "rows": {
+                "600519.SH": [
+                    {"date": "2026-01-05", "close": 10.0},
+                    {"date": "2026-01-06", "close": 11.0},
+                ],
+            }}
+        if job["op"] == "daily" and job.get("adjust") == "hfq":
+            return {"ok": True, "op": "daily", "rows": {
+                "600519.SH": [
+                    {"date": "2026-01-05", "close": 20.0},
+                    {"date": "2026-01-06", "close": 22.0},
+                ],
+            }}
+        return {"ok": True, "op": job["op"], "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    p = StockSDKProvider()
+    w0, w1 = dt.datetime(2026, 1, 1), dt.datetime(2026, 1, 15)
+    p.get_daily(["600519.SH"], w0, w1)
+
+    df = p.get_adj_factors(["600519.SH"], w0, w1)
+
+    # 命中基线后不再有 opAdj 双拉, 只有一套 hfq 请求
+    assert [c["op"] for c in calls[1:]] == ["daily"]
+    assert calls[1]["adjust"] == "hfq"
+    assert df.columns == ["symbol", "trade_date", "ex_factor"]
+    assert df["trade_date"].to_list() == [dt.date(2026, 1, 5), dt.date(2026, 1, 6)]
+    assert df["ex_factor"].to_list() == [2.0, 2.0]
+
+
+def test_adj_mixed_baseline_hit_and_miss(monkeypatch):
+    """缓存外的标的仍走 opAdj 完整双拉, 缓存内的走 hfq-only, 两路结果合并。"""
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        if job.get("adjust") == "none":
+            return {"ok": True, "op": "daily", "rows": {
+                "600519.SH": [{"date": "2026-01-05", "close": 10.0}],
+            }}
+        if job.get("adjust") == "hfq":
+            return {"ok": True, "op": "daily", "rows": {
+                "600519.SH": [{"date": "2026-01-05", "close": 30.0}],
+            }}
+        return {"ok": True, "op": "adj", "rows": {
+            "000001.SZ": [{"symbol": "000001.SZ", "trade_date": "2026-01-05", "ex_factor": 1.5}],
+        }}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    p = StockSDKProvider()
+    w0, w1 = dt.datetime(2026, 1, 1), dt.datetime(2026, 1, 15)
+    p.get_daily(["600519.SH"], w0, w1)
+
+    df = p.get_adj_factors(["600519.SH", "000001.SZ"], w0, w1)
+
+    assert sorted(df["symbol"].unique().to_list()) == ["000001.SZ", "600519.SH"]
+    factors = dict(zip(df["symbol"].to_list(), df["ex_factor"].to_list()))
+    assert abs(factors["600519.SH"] - 3.0) < 1e-9
+    assert abs(factors["000001.SZ"] - 1.5) < 1e-9
+    # 未命中缓存的标的必须走 opAdj(桥接双拉), 不能被 hfq-only 路径吞掉
+    assert any(c["op"] == "adj" for c in calls)
+
+
+def test_adj_breaks_after_consecutive_empty_chunks(monkeypatch):
+    """连续空批(限流形态)应熔断中止, 而不是空转完全部批次。"""
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        return {"ok": True, "op": job["op"], "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 20)]  # 20 批全空
+
+    with pytest.raises(sp.UpstreamThrottledError):
+        StockSDKProvider().get_adj_factors(syms, dt.datetime(2026, 1, 1), dt.datetime.now())
+
+    # 熔断后未开始的批次不再发起桥接调用
+    assert len(calls) < 20
+    assert len(calls) <= sp._EMPTY_BREAK_CHUNKS + sp._PARALLEL_BRIDGE
+
+
+def test_adj_breaker_not_armed_for_history_window(monkeypatch):
+    """历史补数据窗口不熔断: 当年未上市标的的空返回是正常形态, 不可误杀。"""
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        return {"ok": True, "op": job["op"], "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 5)]
+    old_end = dt.datetime(2015, 1, 1)
+
+    df = StockSDKProvider().get_adj_factors(syms, old_end - dt.timedelta(days=365), old_end)
+
+    assert df.is_empty()
+    assert len(calls) == 5  # 全部批次照常执行

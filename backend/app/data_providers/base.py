@@ -16,6 +16,14 @@ import polars as pl
 AssetType = Literal["stock", "index", "etf"]
 
 
+class UpstreamThrottledError(RuntimeError):
+    """上游数据源限流/持续空返回, 本轮拉取中止。
+
+    由具体 provider 在具备熔断条件的拉取路径上抛出(如连续多批完全空结果),
+    调用方据此跳过该阶段并可见化, 而不是空转到超时后与「无新增」混淆。
+    """
+
+
 @dataclass(frozen=True)
 class ProviderCapabilities:
     instruments: bool = False

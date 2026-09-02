@@ -19,7 +19,7 @@ from datetime import datetime
 
 import polars as pl
 
-from app.data_providers.base import AssetType
+from app.data_providers.base import AssetType, UpstreamThrottledError
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
 from app.plugins.stocksdk import bridge
 from app.tickflow.rate_limits import chunked
@@ -44,6 +44,18 @@ _TIMEOUT_MINUTE = 360
 # 在行情错位时会算出 1e26 级脏值(实测), 写入 enriched 后会让 polars f64→i64
 # 严格转换崩溃, 必须在数据边界丢弃。
 _EX_FACTOR_LIMIT = 1e6
+# 熔断: 连续 N 批完全空结果(限流的典型形态)即中止剩余批次并抛 UpstreamThrottledError。
+# 实测被限流时每批仍要 1~2 分钟, 不熔断会空转近一小时且零数据返回, 还与「无新增」混淆。
+_EMPTY_BREAK_CHUNKS = 4
+# 熔断仅对窗口含近 N 天的拉取启用: 历史补数据(extend_history 拉早年)窗口里大量
+# 当日未上市标的空返回是正常形态, 不能据以判定限流。
+_EMPTY_BREAK_RECENT_DAYS = 7
+
+# 日K(none)收盘基线缓存: {(start_yyyymmdd, end_yyyymmdd): DataFrame[symbol, raw_date, close]}。
+# 管道的除权阶段与日K阶段同窗口先后执行, 键精确匹配命中后, 除权只需拉 hfq 一套序列
+# (ex_factor = close_hfq / close_none 由本地合成), 请求数减半。仅保留最近一次窗口,
+# 覆盖式更新; 键含窗口日期, 跨天/跨轮自然失效, 不会用旧基线合成错值。
+_none_close_cache: dict[tuple[str | None, str | None], pl.DataFrame] = {}
 
 _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
 
@@ -55,22 +67,31 @@ def _sane_ex_factor(value: object) -> bool:
     return math.isfinite(v) and 0.0 < v <= _EX_FACTOR_LIMIT
 
 
+def _is_recent_window(end_time: datetime | None) -> bool:
+    if end_time is None:
+        return True
+    return (datetime.now() - end_time).days <= _EMPTY_BREAK_RECENT_DAYS
+
+
 def _execute_chunks(
     chunks: list[list],
     worker: Callable[[list], list[pl.DataFrame]],
     on_chunk_done: Callable[[int, int], None] | None,
+    empty_break_after: int | None = None,
 ) -> list[pl.DataFrame]:
     """以 _PARALLEL_BRIDGE 并发执行各批桥接调用, 返回全部非空帧。
 
     每批是独立 node 子进程, 批间无共享状态; 进度按「已完成批数」单调回调。
     某批抛出(含任务取消经回调传播)时置停止标记: 未开始的批次直接跳过,
     已在飞批次等待自然结束(与原串行行为一致)。
+    empty_break_after: 连续 N 批完全空结果(限流形态)时置停止标记, 等在飞
+    批次结束后抛 UpstreamThrottledError; None = 不启用。
     """
     total = len(chunks)
     frames: list[pl.DataFrame] = []
     if not total:
         return frames
-    state = {"done": 0}
+    state = {"done": 0, "empty_streak": 0, "broken_streak": 0}
     lock = threading.Lock()
     cancelled = threading.Event()
 
@@ -81,6 +102,13 @@ def _execute_chunks(
         # 计数与回调同锁, 保证多批并行时进度回调仍单调递增
         with lock:
             state["done"] += 1
+            if part:
+                state["empty_streak"] = 0
+            elif empty_break_after:
+                state["empty_streak"] += 1
+                if state["empty_streak"] >= empty_break_after:
+                    state["broken_streak"] = state["empty_streak"]
+                    cancelled.set()
             if on_chunk_done:
                 on_chunk_done(state["done"], total)
         return part
@@ -97,6 +125,10 @@ def _execute_chunks(
                 raise
     finally:
         pool.shutdown(wait=True)
+    if state["broken_streak"]:
+        raise UpstreamThrottledError(
+            f"连续 {state['broken_streak']} 批空结果(上游限流形态), 中止剩余 {total - state['done']} 批"
+        )
     return frames
 
 
@@ -139,6 +171,9 @@ class StockSDKProvider:
         if not symbols:
             return pl.DataFrame()
         logger.info("stock-sdk daily 拉取开始(%d symbols)", len(symbols))
+        # 原始 none 收盘(symbol, raw_date, close), 供除权阶段本地合成 ex_factor。
+        # worker 多线程 append, 依赖 list.append 的 GIL 原子性。
+        baseline: list[tuple[str, str, float]] = []
 
         def worker(chunk: list[str]) -> list[pl.DataFrame]:
             job = {
@@ -158,12 +193,24 @@ class StockSDKProvider:
             for sym, rows in (result.get("rows") or {}).items():
                 if not rows:
                     continue
+                for b in rows:
+                    d, c = b.get("date"), b.get("close")
+                    if d and isinstance(c, (int, float)) and math.isfinite(c) and c > 0:
+                        baseline.append((sym, str(d), float(c)))
                 df = normalize_daily(rows, default_symbol=sym, source=self.name)
                 if not df.is_empty():
                     frames.append(df)
             return frames
 
         frames = _execute_chunks(chunked(symbols, _BATCH), worker, on_chunk_done)
+        # 覆盖式只留最近一次窗口; 拉取全空时清缓存, 避免残留旧窗口被误配
+        _none_close_cache.clear()
+        if baseline:
+            _none_close_cache[(_yyyymmdd(start_time), _yyyymmdd(end_time))] = pl.DataFrame(
+                baseline,
+                schema={"symbol": pl.Utf8, "raw_date": pl.Utf8, "close": pl.Float64},
+                orient="row",
+            )
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     # ---- adj_factor ----
@@ -178,7 +225,33 @@ class StockSDKProvider:
         if not symbols:
             return pl.DataFrame()
 
-        def worker(chunk: list[str]) -> list[pl.DataFrame]:
+        # 与最近一次 get_daily 同窗口时复用 none 收盘基线: 命中的 symbol 只拉
+        # hfq 一套序列(ex_factor 本地合成), 未命中的走 opAdj 完整双拉, 行为不变。
+        base = _none_close_cache.get((_yyyymmdd(start_time), _yyyymmdd(end_time)))
+        cached_syms: set[str] = set()
+        if base is not None and not base.is_empty():
+            cached_syms = set(base["symbol"].unique().to_list())
+        hit = [s for s in symbols if s in cached_syms]
+        miss = [s for s in symbols if s not in cached_syms]
+        if cached_syms:
+            logger.info("stock-sdk adj: %d 只复用日K none 基线(仅拉 hfq), %d 只完整拉取",
+                        len(hit), len(miss))
+
+        # 熔断仅对含近几天的窗口启用(历史补数据窗口的空返回是正常形态)
+        breaker = _EMPTY_BREAK_CHUNKS if _is_recent_window(end_time) else None
+
+        miss_chunks = list(chunked(miss, _BATCH))
+        hit_chunks = list(chunked(hit, _BATCH))
+        grand_total = len(miss_chunks) + len(hit_chunks)
+        if not grand_total:
+            return pl.DataFrame()
+
+        def _progress(offset: int) -> Callable[[int, int], None] | None:
+            if on_chunk_done is None:
+                return None
+            return lambda done, _tot: on_chunk_done(offset + done, grand_total)
+
+        def miss_worker(chunk: list[str]) -> list[pl.DataFrame]:
             job = {
                 "op": "adj",
                 "symbols": chunk,
@@ -205,8 +278,68 @@ class StockSDKProvider:
             df = normalize_adj_factors(sane, source=self.name)
             return [df] if not df.is_empty() else []
 
-        frames = _execute_chunks(chunked(symbols, _BATCH), worker, on_chunk_done)
-        return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+        def hit_worker(chunk: list[str]) -> list[pl.DataFrame]:
+            job = {
+                "op": "daily",
+                "symbols": chunk,
+                "adjust": "hfq",
+                "start": _yyyymmdd(start_time),
+                "end": _yyyymmdd(end_time),
+                "concurrency": _CONCURRENCY,
+            }
+            try:
+                result = bridge.run_job(job, timeout=_TIMEOUT_ADJ)
+            except bridge.StockSDKBridgeError as e:
+                logger.warning("stock-sdk hfq 拉取失败(%d symbols): %s", len(chunk), e)
+                return []
+            bars: list[dict] = []
+            for sym, rows in (result.get("rows") or {}).items():
+                for b in rows or []:
+                    if b and b.get("date") is not None and b.get("close") is not None:
+                        bars.append({"symbol": sym, "raw_date": str(b["date"]),
+                                     "hfq_close": b["close"]})
+            if not bars:
+                return []
+            hfq = pl.DataFrame(bars).with_columns(
+                pl.col("hfq_close").cast(pl.Float64, strict=False)
+            )
+            merged = hfq.join(
+                base.select(["symbol", "raw_date", "close"]),
+                on=["symbol", "raw_date"], how="inner",
+            )
+            if merged.is_empty():
+                return []
+            merged = merged.with_columns(
+                (pl.col("hfq_close") / pl.col("close")).alias("ex_factor")
+            )
+            sane = [r for r in merged.iter_rows(named=True) if _sane_ex_factor(r["ex_factor"])]
+            if len(sane) < merged.height:
+                logger.warning(
+                    "stock-sdk adj(基线合成) 丢弃 %d 条异常除权因子(非有限/<=0/>%.0e), 防止污染 enriched",
+                    merged.height - len(sane), _EX_FACTOR_LIMIT,
+                )
+            if not sane:
+                return []
+            dicts = [{"symbol": r["symbol"], "trade_date": r["raw_date"],
+                      "ex_factor": r["ex_factor"]} for r in sane]
+            df = normalize_adj_factors(dicts, source=self.name)
+            return [df] if not df.is_empty() else []
+
+        frames: list[pl.DataFrame] = []
+        if miss_chunks:
+            frames.extend(_execute_chunks(
+                miss_chunks, miss_worker, _progress(0), empty_break_after=breaker))
+        if hit_chunks:
+            frames.extend(_execute_chunks(
+                hit_chunks, hit_worker, _progress(len(miss_chunks)), empty_break_after=breaker))
+
+        combined = pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
+        if combined.is_empty() and len(symbols) >= 100:
+            logger.warning(
+                "stock-sdk adj: %d 只标的 0 行返回(窗口 %s ~ %s), 疑似上游限流而非无新增",
+                len(symbols), _yyyymmdd(start_time), _yyyymmdd(end_time),
+            )
+        return combined
 
     # ---- minute ----
     def get_minute(
