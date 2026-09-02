@@ -2353,7 +2353,28 @@ export const api = {
   pipelineRun: () => request<{ job_id: string; reused: boolean }>(
     '/api/pipeline/run', { method: 'POST' },
   ),
-  pipelineJob: (id: string) => request<PipelineJob>(`/api/pipeline/jobs/${id}`),
+  // running 任务仅存于后端内存(终态才落盘), 服务重启即消失。轮询 404 时合成
+  // failed 终态: 各轮询方凭 status 自然停止, 不再每秒 404 → toast 刷屏。
+  pipelineJob: async (id: string): Promise<PipelineJob> => {
+    try {
+      return await request<PipelineJob>(`/api/pipeline/jobs/${id}`, { quiet: true })
+    } catch (e) {
+      if (!/job not found/.test(String((e as Error)?.message ?? ''))) throw e
+      return {
+        id,
+        status: 'failed',
+        stage: 'interrupted',
+        progress: 0,
+        stage_pct: 0,
+        log: [],
+        started_at: null,
+        finished_at: new Date().toISOString(),
+        duration_s: null,
+        result: null,
+        error: '任务不存在(后端可能已重启,运行中的任务已中断),请重新触发同步',
+      }
+    }
+  },
   pipelineJobs: (limit = 20) =>
     request<{ active_id: string | null; jobs: PipelineJobSummary[] }>(
       `/api/pipeline/jobs?limit=${limit}`,

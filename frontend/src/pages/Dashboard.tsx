@@ -679,6 +679,7 @@ export function Dashboard() {
           isFetching={isFetching}
           isStarting={startFetch.isPending}
           fetchFailed={fetchFailed}
+          fetchError={fetchStatus.data?.error}
           stage={fetchStatus.data?.stage}
           fetchPct={fetchStatus.data?.progress}
           onStart={() => startFetch.mutate()}
@@ -873,12 +874,13 @@ export function Dashboard() {
 
 // ===== 无数据常驻引导卡片: 一键触发盘后管道获取行情数据(无 Key 也可) =====
 function FetchDataCard({
-  isFetching, isStarting, fetchFailed, stage, fetchPct, onStart,
+  isFetching, isStarting, fetchFailed, fetchError, stage, fetchPct, onStart,
   isTickflowProvider, providerLabel,
 }: {
   isFetching: boolean
   isStarting: boolean
   fetchFailed: boolean
+  fetchError?: string | null
   stage?: string
   fetchPct?: number
   onStart: () => void
@@ -926,8 +928,8 @@ function FetchDataCard({
               </div>
             </div>
           ) : fetchFailed ? (
-            <div className="mt-3 flex items-center gap-2">
-              <span className="text-xs text-danger">同步失败,请重试</span>
+            <div className="mt-3 space-y-2">
+              <div className="text-xs text-danger">{fetchError || '同步失败,请重试'}</div>
               <button
                 onClick={onStart}
                 className="inline-flex items-center gap-1.5 px-3 h-8 rounded-btn bg-accent text-white text-xs font-medium hover:bg-accent/90 transition-colors"
