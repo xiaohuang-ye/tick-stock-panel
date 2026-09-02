@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from datetime import date, timedelta
 from functools import lru_cache
 from typing import Optional
@@ -899,6 +900,134 @@ def sync_batch(
     capset = request.app.state.capabilities
     n = kline_sync.sync_and_persist_daily_batch(symbols, repo, capset, count=days)
     return {"symbols": symbols, "rows_written": n}
+
+
+def _normalize_symbol_inputs(raw: list[str]) -> tuple[list[str], list[str]]:
+    """把用户输入的代码规范化为内部 symbol 格式。
+
+    '600519' / 'sh600519' / '600519.SH' → '600519.SH'。后缀推断: 92/4/8 开头
+    为北交所, 5/6/9 开头为沪市, 其余 (0/1/2/3 开头, 含 15x ETF) 为深市。
+    返回 (规范化成功的 symbols, 无法识别的原始输入), 成功列表去重保序。
+    """
+    ok: list[str] = []
+    bad: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        s = (item or "").strip().upper()
+        if not s:
+            continue
+        m = re.search(r"(\d{6})", s)
+        if not m:
+            bad.append(item)
+            continue
+        code = m.group(1)
+        if s.endswith(".SH") or s.startswith("SH"):
+            suffix = "SH"
+        elif s.endswith(".SZ") or s.startswith("SZ"):
+            suffix = "SZ"
+        elif s.endswith(".BJ") or s.startswith("BJ"):
+            suffix = "BJ"
+        elif code.startswith("92") or code[0] in "48":
+            suffix = "BJ"
+        elif code[0] in "569":
+            suffix = "SH"
+        else:
+            suffix = "SZ"
+        sym = f"{code}.{suffix}"
+        if sym not in seen:
+            seen.add(sym)
+            ok.append(sym)
+    return ok, bad
+
+
+@router.post("/sync_symbols")
+async def sync_symbols(request: Request):
+    """按股票同步 — 只更新指定个股的近期日K/除权因子/enriched, 不跑全市场。
+
+    典型场景: 收盘后只想快速刷新几只关注标的, 等不及全市场盘后管道。
+    body: { "symbols": ["600519", "000001.SZ", ...], "days": 30 }
+    返回 job_id, 可轮询 /api/pipeline/jobs/{id} 查看进度。
+    """
+    import asyncio
+    import traceback as _tb
+    try:
+        body = await request.json()
+        raw_symbols = body.get("symbols")
+        days = body.get("days", 30)
+        if not isinstance(raw_symbols, list) or not any(str(x).strip() for x in raw_symbols):
+            raise HTTPException(status_code=400, detail="symbols 不能为空")
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="days 需为 1~365 的整数")
+        if not 1 <= days <= 365:
+            raise HTTPException(status_code=400, detail="days 需在 1~365 之间")
+
+        symbols, bad = _normalize_symbol_inputs([str(x) for x in raw_symbols])
+        if bad:
+            raise HTTPException(status_code=400, detail=f"无法识别的代码: {', '.join(bad)}")
+        if len(symbols) > 100:
+            raise HTTPException(status_code=400, detail="单次最多 100 只, 更多请使用「立即同步」全量管道")
+
+        repo = request.app.state.repo
+        capset = request.app.state.capabilities
+
+        from app.tickflow.capabilities import Cap
+        if not capset.has(Cap.KLINE_DAILY_BATCH):
+            raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
+
+        from app.jobs import daily_pipeline
+        from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
+        from app.api.data import invalidate_storage_cache
+
+        job_id, is_new = job_store.create()
+        if not is_new:
+            return {"status": "reused", "job_id": job_id}
+
+        async def task() -> None:
+            if not try_acquire_run_slot(job_id):
+                job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
+                return
+            loop = asyncio.get_event_loop()
+            qs = getattr(request.app.state, "quote_service", None)
+
+            def progress(stage: str, pct: int, msg: str,
+                         stage_pct: int | None = None, skip_log: bool = False) -> None:
+                job_store.progress(job_id, stage, pct, msg,
+                                   stage_pct=stage_pct, skip_log=skip_log)
+
+            def _run() -> dict:
+                # 同步运行期间暂停实时行情, 防止覆写同一批 parquet 竞态
+                if qs:
+                    with qs.paused():
+                        return daily_pipeline.run_symbols_sync(
+                            repo, capset, symbols, days=days, on_progress=progress)
+                return daily_pipeline.run_symbols_sync(
+                    repo, capset, symbols, days=days, on_progress=progress)
+
+            try:
+                job_store.start(job_id)
+                result = await loop.run_in_executor(_long_task_executor, _run)
+                job_store.succeed(job_id, result)
+                invalidate_storage_cache()
+                repo.refresh_cache()
+            except JobCancelledError:
+                # 已由 terminate() 标记失败, 拉取线程在分块回调处自行退出
+                invalidate_storage_cache()
+            except Exception as e:
+                logger.exception("sync_symbols failed: job_id=%s", job_id)
+                job_store.fail(job_id, str(e))
+                invalidate_storage_cache()
+            finally:
+                release_run_slot(job_id)
+
+        asyncio.create_task(task())
+        return {"status": "started", "job_id": job_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("sync_symbols error: %s\n%s", e, _tb.format_exc())
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.post("/refresh_views")

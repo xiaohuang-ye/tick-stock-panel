@@ -2001,6 +2001,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ start_date: startDate }),
     }),
+  syncSymbols: (symbols: string[], days = 30) =>
+    request<{ status: string; job_id: string }>('/api/kline/sync_symbols', {
+      method: 'POST',
+      body: JSON.stringify({ symbols, days }),
+    }),
   rebuildEnriched: () =>
     request<{ status: string; job_id: string }>('/api/kline/rebuild_enriched', {
       method: 'POST',

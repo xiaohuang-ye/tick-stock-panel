@@ -663,6 +663,89 @@ def run_now(
     return result
 
 
+def run_symbols_sync(
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    symbols: list[str],
+    days: int = 30,
+    on_progress: ProgressCb | None = None,
+) -> dict:
+    """按股票同步 — 只拉指定个股的近期日K/除权因子并局部重算其 enriched。
+
+    与 run_now (全市场) 相互独立: 不动维表/指数/ETF/分钟/市场环境, 耗时与股票
+    数量成正比, 用于收盘后快速刷新少数关注标的的最新数据。日K/除权落盘为
+    merge-upsert; enriched 走 run_pipeline(new_dates_only=True, symbols=...)
+    局部重算 — 已有分区只替换这些个股的行, 新日期分区按当日日K里的全部标的
+    补齐, 保持「每个日K日期分区对应全市场 enriched 分区」的不变式 (否则后续
+    全市场管道会把该日期视为已计算而跳过, 其余个股该日的 enriched 永久缺失)。
+    """
+    emit = on_progress or _noop
+    skipped: list[str] = []
+    if not symbols:
+        raise ValueError("symbols 不能为空")
+
+    from datetime import date as _date
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+    today = _date.today()
+    start_date = today - _td(days=max(1, days))
+
+    # Step 1: 日K (batch 拉取, merge-upsert 按 symbol+date 覆盖旧值)
+    emit("sync_daily", 5, f"获取 {len(symbols)} 只个股日K [{start_date} ~ {today}]…")
+    written_daily = kline_sync.sync_and_persist_daily_batch(
+        symbols, repo, capset,
+        start_date=_dt.combine(start_date, _dt.min.time()),
+        end_date=_dt.combine(today, _dt.min.time()),
+    )
+    emit("sync_daily", 40, f"日K 完成,{written_daily} 行")
+    logger.info("sync_symbols: daily [%s ~ %s] done, %d rows", start_date, today, written_daily)
+    _invalidate("daily")
+
+    # Step 2: 除权因子 — 与日K同窗口, 覆盖窗口内的新除权事件
+    adj_provider = _prefs.get_adj_factor_provider()
+    if adj_provider == "same_as_daily":
+        adj_provider = _prefs.get_daily_data_provider()
+    written_adj, affected_symbols = 0, []
+    if capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow":
+        emit("sync_adj", 45, "获取除权因子…")
+        written_adj, affected_symbols = kline_sync.sync_adj_factor(
+            symbols, repo, capset,
+            start_time=_dt.combine(start_date, _dt.min.time()),
+            end_time=_dt.now(),
+        )
+        if affected_symbols:
+            _refresh_single_view(repo, "adj_factor")
+        emit("sync_adj", 55, f"除权因子完成,{written_adj} 行")
+        _invalidate("adj_factor")
+    else:
+        skipped.append("sync_adj")
+        logger.info("sync_symbols: sync_adj skipped (no ADJ_FACTOR capability)")
+
+    # Step 3: enriched 局部重算 (新日期分区全市场补齐 + 指定个股全历史重算)
+    emit("compute_enriched", 60, f"重算 {len(symbols)} 只个股指标…")
+    written_enriched = run_pipeline(symbols=symbols, new_dates_only=True)
+    _refresh_single_view(repo, "kline_enriched")
+    _invalidate("enriched")
+    emit("compute_enriched", 90, f"指标重算完成,{written_enriched} 行")
+    logger.info("sync_symbols: enriched %d rows, adj-affected %d",
+                written_enriched, len(affected_symbols))
+
+    # Step 4: 刷新视图
+    emit("refresh_views", 95, "刷新视图…")
+    _refresh_views(repo)
+    emit("done", 100, "完成")
+    _invalidate(None)
+
+    return {
+        "symbols": len(symbols),
+        "daily_rows": written_daily,
+        "adj_factor_rows": written_adj,
+        "adj_factor_symbols": len(affected_symbols),
+        "enriched_rows": written_enriched,
+        "skipped_stages": skipped,
+    }
+
+
 def _refresh_views(repo: KlineRepository) -> None:
     """刷新所有 DuckDB 视图 —— 委托给 repository 的唯一权威实现 rebuild_views()。"""
     repo.rebuild_views()

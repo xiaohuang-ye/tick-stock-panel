@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   Info,
   WandSparkles,
+  Zap,
 } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { EndpointTestDialog } from '@/components/EndpointTestDialog'
@@ -42,6 +43,7 @@ import { SettingsModal } from '@/components/data/SettingsModal'
 import { ScheduleEditor } from '@/components/data/ScheduleEditor'
 import { ExtendHistoryPanel } from '@/components/data/ExtendHistoryPanel'
 import { RepairDailyPanel } from '@/components/data/RepairDailyPanel'
+import { SyncSymbolsPanel } from '@/components/data/SyncSymbolsPanel'
 import { EnrichedRebuildPanel } from '@/components/data/EnrichedRebuildPanel'
 import { MinuteSyncConfig } from '@/components/data/MinuteSyncConfig'
 import { RegimeConfigCard } from '@/components/data/RegimeConfigCard'
@@ -144,6 +146,7 @@ export function Data() {
   const [showEndpointTest, setShowEndpointTest] = useState(false)
   const [showCreateExt, setShowCreateExt] = useState(false)
   const [showRepair, setShowRepair] = useState(false)
+  const [showSyncSymbols, setShowSyncSymbols] = useState(false)
   const [editingExt, setEditingExt] = useState<ExtDataConfig | null>(null)
   const [indexBatchInput, setIndexBatchInput] = useState('100')
 
@@ -601,6 +604,14 @@ export function Data() {
               数据范围
             </button>
             <button
+              onClick={() => setShowSyncSymbols(true)}
+              disabled={!hasData || isRunning}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150 disabled:opacity-40 disabled:pointer-events-none"
+            >
+              <Zap className="h-3.5 w-3.5" />
+              按股票同步
+            </button>
+            <button
               onClick={() => setShowRepair(true)}
               disabled={!hasData || isRunning}
               className="inline-flex items-center gap-1 px-2 py-1 rounded-btn text-secondary hover:text-accent hover:bg-accent/8 text-xs transition-colors duration-150 disabled:opacity-40 disabled:pointer-events-none"
@@ -977,6 +988,18 @@ export function Data() {
               isRunning={!!activeJobId}
               earliestDate={s?.daily?.earliest_date ?? null}
               onStart={() => setOpenSettings(null)}
+            />
+          </SettingsModal>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {showSyncSymbols && (
+          <SettingsModal title="日 K · 按股票同步" onClose={() => setShowSyncSymbols(false)}>
+            <SyncSymbolsPanel
+              caps={caps.data}
+              isRunning={!!activeJobId}
+              onStart={() => setShowSyncSymbols(false)}
             />
           </SettingsModal>
         )}
