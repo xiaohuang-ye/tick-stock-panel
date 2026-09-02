@@ -61,6 +61,24 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+_REPLACE_RETRY_ATTEMPTS = 5
+_REPLACE_RETRY_BASE_DELAY = 0.15
+
+
+def _replace_with_retry(temporary: Path, out: Path) -> None:
+    """os.replace 在 Windows 上可能因杀毒/索引服务等外部句柄瞬时锁住目标文件而报
+    PermissionError (WinError 5), 这类占用通常亚秒级释放; 短退避重试, 耗尽后抛出
+    最后一次的原始错误, 避免长时间管道因一次瞬时占用整体失败。"""
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            os.replace(temporary, out)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_RETRY_BASE_DELAY * (attempt + 1))
+
+
 def _write_marker(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -69,7 +87,7 @@ def _write_marker(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, stream, separators=(",", ":"))
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        _replace_with_retry(temporary, path)
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
@@ -259,7 +277,7 @@ class EnrichedPublication:
                 os.fsync(stream.fileno())
             with _exclusive_generation_lock(self.data_dir, self.asset_type):
                 self._claim_or_verify()
-                os.replace(temporary, out)
+                _replace_with_retry(temporary, out)
                 _fsync_directory(out.parent)
                 self._changed = True
         finally:
