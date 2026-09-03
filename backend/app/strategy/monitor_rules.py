@@ -18,9 +18,10 @@ import json
 import logging
 import math
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from app.services.fs_utils import atomic_write_text
 from app.strategy.custom_signals import ALLOWED_FIELDS
 from app.strategy.intraday_signals import uses_intraday_signals
 
@@ -28,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────
 ID_RE = re.compile(r"^[a-z0-9_]{1,40}$")
-RULE_TYPES = {"strategy", "signal", "price", "market", "ladder", "sector", "abnormal"}
+RULE_TYPES = {"strategy", "signal", "price", "market", "ladder", "sector", "abnormal", "volume_delta", "date"}
 SCOPES = {"symbols", "all", "sector", "watchlist_group"}
 LOGICS = {"and", "or"}
 DIRECTIONS = {"entry", "exit", "both"}
@@ -45,6 +46,19 @@ SECTOR_WINDOWS = {1, 3, 5, 10, 15}
 # abnormal 规则 (异动边缘): 接近度方向 / 关注窗口
 ABNORMAL_DIRECTIONS = {"up", "down", "both"}
 ABNORMAL_WINDOWS = {"any", "3d", "10d", "30d"}
+# volume_delta 规则 (轮询放量): 阈值口径 (手数 / 成交额)
+VD_METRICS = {"volume", "amount"}
+# volume_delta 基础过滤默认值 (与策略 DEFAULT_BASIC_FILTER 核心子集对齐:
+# 价格 3-300 元, 总市值 >=10 亿, 当日成交额 >=2000 万, 剔除 ST)
+VD_BASIC_FILTER_DEFAULTS: dict = {
+    "price_min": 3,
+    "price_max": 300,
+    "market_cap_min": 10e8,
+    "float_cap_min": None,
+    "float_cap_max": None,
+    "amount_min": 0.2e8,
+    "exclude_st": True,
+}
 
 # 布尔信号列前缀 (op=truth 时 field 取这些)
 _SIGNAL_PREFIXES = ("signal_", "csg_")
@@ -87,7 +101,7 @@ def load_one(data_dir: Path, rule_id: str) -> dict | None:
 def save_one(data_dir: Path, rule: dict) -> None:
     p = _path(data_dir, rule["id"])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(rule, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(p, json.dumps(rule, ensure_ascii=False, indent=2))
 
 
 def delete_one(data_dir: Path, rule_id: str) -> bool:
@@ -102,6 +116,22 @@ def delete_one(data_dir: Path, rule_id: str) -> bool:
 def _is_signal_field(field: str) -> bool:
     """判断 field 是否为布尔信号列 (signal_ / csg_ 前缀)。"""
     return any(field.startswith(p) for p in _SIGNAL_PREFIXES)
+
+
+def date_rule_in_window(remind_date: str, lead_days: int, today: str) -> bool:
+    """提醒窗口 [remind_date - lead_days, remind_date] 是否包含 today (均 YYYY-MM-DD)。
+
+    只判自然日历窗口; 是否在交易时段由调用方决定。到期落在休市/节假日不会顺延,
+    需 lead_days 覆盖 (交易日历口径待 issue 定夺)。非法输入一律返回 False (fail-safe)。
+    """
+    try:
+        remind = date.fromisoformat(remind_date)
+        today_d = date.fromisoformat(today)
+        lead = max(0, int(lead_days or 0))
+    except (ValueError, TypeError):
+        return False
+    start = remind - timedelta(days=lead)
+    return start <= today_d <= remind
 
 
 def validate(rule: dict) -> None:
@@ -190,6 +220,53 @@ def validate(rule: dict) -> None:
         threshold_pct = rule.get("threshold_pct")
         if not isinstance(threshold_pct, (int, float)) or not 1 <= threshold_pct <= 150:
             raise ValueError("异动接近度阈值必须是 1 到 150 之间的百分比数字")
+    elif rule.get("type") == "volume_delta":
+        # 轮询放量监控: 相邻两次全市场快照的成交量/成交额差值, 不用 conditions
+        if rule.get("asset_type", "stock") != "stock":
+            raise ValueError("轮询放量监控仅支持个股 (依赖全市场股票快照)")
+        if rule.get("scope", "all") == "sector":
+            raise ValueError("轮询放量监控不支持板块作用域")
+        if rule.get("metric", "volume") not in VD_METRICS:
+            raise ValueError(f"metric 必须是 {VD_METRICS} 之一 (volume=手数, amount=金额)")
+        if rule.get("metric", "volume") == "amount":
+            thr = rule.get("threshold_amount")
+            if isinstance(thr, bool) or not isinstance(thr, (int, float)) or not math.isfinite(thr) or thr < 1:
+                raise ValueError("threshold_amount 必须是 >=1 的数字 (单轮成交额增量, 单位元)")
+        else:
+            thr = rule.get("threshold_volume")
+            if isinstance(thr, bool) or not isinstance(thr, (int, float)) or not math.isfinite(thr) or thr < 1:
+                raise ValueError("threshold_volume 必须是 >=1 的数字 (单轮成交量增量, 单位手)")
+        bf = rule.get("basic_filter")
+        if bf is not None:
+            if not isinstance(bf, dict):
+                raise ValueError("basic_filter 必须是对象")
+            for key, value in bf.items():
+                if key == "exclude_st":
+                    if not isinstance(value, bool):
+                        raise ValueError("basic_filter.exclude_st 必须是布尔值")
+                elif key in ("price_min", "price_max", "market_cap_min", "float_cap_min",
+                             "float_cap_max", "amount_min"):
+                    if value is not None and (
+                        isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not math.isfinite(value) or value <= 0
+                    ):
+                        raise ValueError(f"basic_filter.{key} 必须是正数字或 null")
+                else:
+                    raise ValueError(f"basic_filter 不支持字段: {key}")
+    elif rule.get("type") == "date":
+        # 日期提醒: 纯日历, 锚定标的 (scope=symbols) 避免无对象的空提醒
+        remind = rule.get("remind_date")
+        if not isinstance(remind, str) or not remind.strip():
+            raise ValueError("日期提醒规则必须指定 remind_date")
+        try:
+            date.fromisoformat(remind.strip())
+        except ValueError:
+            raise ValueError(f"remind_date 必须是 YYYY-MM-DD 日期: {remind!r}") from None
+        lead = rule.get("lead_days", 0)
+        if isinstance(lead, bool) or not isinstance(lead, int) or lead < 0:
+            raise ValueError("lead_days 必须是非负整数 (提前提醒天数)")
+        if rule.get("conditions"):
+            raise ValueError("日期提醒规则不支持行情 conditions")
     else:
         # 信号/价格/市场类型: 需要 conditions
         conds = rule.get("conditions")
@@ -254,7 +331,7 @@ def normalize(rule: dict) -> dict:
     r.setdefault("enabled", True)
     r.setdefault("asset_type", "stock")
     # sector/abnormal 默认全市场 (sector 随后强制 all; abnormal 支持指定标的)
-    r.setdefault("scope", "all" if r.get("type") in {"sector", "abnormal"} else "symbols")
+    r.setdefault("scope", "all" if r.get("type") in {"sector", "abnormal", "volume_delta"} else "symbols")
     r.setdefault("symbols", [])
     r.setdefault("group_id", None)
     # watchlist_group 作用域: 成员动态来自分组, symbols 不参与; 其他作用域清掉残留 group_id
@@ -290,10 +367,25 @@ def normalize(rule: dict) -> dict:
     # ladder 专属默认字段
     r.setdefault("metric", "sealed_vol")
     r.setdefault("threshold", 0)
+    # volume_delta 专属默认字段 (轮询放量): 冷却期默认 300s 而非 3600s --
+    # 持续放量会连续多轮达标, 1 小时只提醒一次太迟钝。
+    if r.get("type") == "volume_delta":
+        if r.get("cooldown_seconds") is None:
+            r["cooldown_seconds"] = 300
+        r["metric"] = r["metric"] if r.get("metric") in VD_METRICS else "volume"
+        r.setdefault("threshold_volume", 9000)
+        r.setdefault("threshold_amount", 1e6)
+        r["basic_filter"] = {**VD_BASIC_FILTER_DEFAULTS, **(r.get("basic_filter") or {})}
     if r.get("type") == "sector":
         r["scope"] = "all"
         r["symbols"] = []
         r["group_id"] = None
+    # date 专属默认字段 (日期提醒): 纯日历窗口, 无行情条件, 每天至多一次
+    if r.get("type") == "date":
+        r["conditions"] = []
+        r.setdefault("remind_date", None)
+        r["lead_days"] = int(r.get("lead_days") or 0)
+        r["cooldown_seconds"] = 86400
     # abnormal 专属默认字段 (异动边缘监控)
     r.setdefault("abnormal_window", "any")
     r.setdefault("logic", "and")

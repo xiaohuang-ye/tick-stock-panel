@@ -23,6 +23,7 @@ from app.api import (
     indices,
     intraday,
     kline,
+    lots,
     market_recap,
     mining,
     monitor_rules,
@@ -172,6 +173,16 @@ async def _application_lifespan(app: FastAPI):
         depth_service.start_polling()
     except Exception as e:  # noqa: BLE001
         logger.warning("depth_service init failed: %s", e)
+
+    # 盘中分钟增量刷新 (Expert 专有): 线程常驻, 开关/时段/能力门控在循环内每轮判断
+    try:
+        from app.services.minute_refresh import MinuteRefreshService
+        minute_refresh = MinuteRefreshService(repo)
+        minute_refresh.set_app_state(app.state)
+        app.state.minute_refresh = minute_refresh
+        minute_refresh.start()
+    except Exception as e:
+        logger.warning("minute_refresh init failed: %s", e)
 
     # 停机缺口自检: 延迟后台扫描, 发现最近交易日的盘中快照/缺口时自动创建
     # 修复任务 (盘中停机→次日开实时场景, 不修则坏数据被"只刷今天"分支永久留存)
@@ -356,6 +367,9 @@ async def _application_lifespan(app: FastAPI):
         wbot = getattr(app.state, "wecom_bot_service", None)
         if wbot:
             wbot.stop()
+        mrs = getattr(app.state, "minute_refresh", None)
+        if mrs:
+            mrs.stop()
         logger.info("shutdown")
 
 
@@ -458,6 +472,7 @@ app.include_router(settings_api.router)
 app.include_router(strategy.router)
 app.include_router(signals.router)
 app.include_router(monitor_rules.router)
+app.include_router(lots.router)
 app.include_router(alerts.router)
 app.include_router(rps.router)
 

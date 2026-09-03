@@ -97,6 +97,9 @@ class RuleModel(BaseModel):
     conditions: list[ConditionModel] = []
     logic: str = "and"        # and | or
     cooldown_seconds: int = 3600
+    # date 类型 (日期提醒): 纯日历窗口, 无 conditions
+    remind_date: str | None = None   # YYYY-MM-DD
+    lead_days: int = 0               # 提前 N 天进入提醒窗口
     severity: str = "info"    # info | warn | critical
     webhook_url: str = ""     # Webhook 推送地址 (推送到 QMT 等外部软件, 待定)
     webhook_enabled: bool = False  # 兼容老规则 (已由 webhook_channels 取代, 仅做向后兼容读)
@@ -107,6 +110,11 @@ class RuleModel(BaseModel):
     # ladder 专属 (连板梯队封单监控)
     metric: str = "sealed_vol"   # sealed_vol=封单量(手) | sealed_amount=封单额(元)
     threshold: float = 0         # 封单 <= 此值时报警 (原始单位: 量=手, 额=元)
+    # volume_delta 专属 (轮询放量监控): 相邻两次全市场快照的成交量增量
+    threshold_volume: float = 9000   # 单轮增量 >= 此值(手)时报警
+    threshold_amount: float = 1e6    # metric=amount 时: 单轮增量 >= 此值(元)时报警
+    # 基础过滤 (与策略 basic_filter 语义对齐): 值为 null 表示不过滤
+    basic_filter: dict = {}
 
 
 # ── 字段选项 ─────────────────────────────────────────────
@@ -160,6 +168,8 @@ def get_options(request: Request):
             {"key": "strategy", "label": "策略监控"},
             {"key": "abnormal", "label": "异动监控"},
             {"key": "sector", "label": "板块监控"},
+            {"key": "volume_delta", "label": "轮询放量"},
+            {"key": "date", "label": "日期提醒"},
         ],
         "scopes": [
             {"key": "symbols", "label": "指定标的"},
@@ -282,6 +292,9 @@ def save_rule(req: RuleModel, request: Request):
             raise HTTPException(status_code=400, detail=str(e)) from e
     # 编辑现有规则时, 保留原 created_at (避免按时间排序时位置跳动)
     existing = monitor_rules.load_one(_data_dir(request), rule["id"])
+    # 批次派生规则由「持仓提醒」页托管, 监控中心只读 (启停/改/删均回持仓页)
+    if existing and existing.get("lot_id"):
+        raise HTTPException(status_code=409, detail="该规则由「持仓提醒」页托管, 请在持仓提醒页修改")
     if existing and existing.get("created_at"):
         rule["created_at"] = existing["created_at"]
     try:
@@ -338,6 +351,10 @@ def save_rule(req: RuleModel, request: Request):
 def delete_rule(rule_id: str, request: Request):
     if not monitor_rules.ID_RE.match(rule_id):
         raise HTTPException(status_code=400, detail="规则 id 非法")
+    # 批次派生规则由「持仓提醒」页托管, 删除需在持仓页操作 (级联清理派生规则)
+    existing = monitor_rules.load_one(_data_dir(request), rule_id)
+    if existing and existing.get("lot_id"):
+        raise HTTPException(status_code=409, detail="该规则由「持仓提醒」页托管, 请在持仓提醒页删除批次")
     deleted = monitor_rules.delete_one(_data_dir(request), rule_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="规则不存在")

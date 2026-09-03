@@ -551,6 +551,9 @@ class MarketMatrix:
     exit_signal_code: np.ndarray
     entry_signal_ids: tuple[str, ...]
     exit_signal_ids: tuple[str, ...]
+    # 逐格入场价覆盖 (time x asset, NaN=回退 open/close 惯例)。分钟策略回测用:
+    # 信号在盘中第 m 根触发, 入场价 = 触发分钟收盘价, 而非当日开盘/收盘。
+    entry_price: np.ndarray | None = None
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -1424,12 +1427,23 @@ def _populate_matrix_derived_arrays(
     if "turnover_rate" in wanted_fields and "turnover_rate" not in parquet_fields:
         float_shares = fields.get("float_shares")
         if float_shares is None:
-            raise ValueError("matrix turnover_rate requires float_shares")
-        _write_turnover_rate_matrix(
-            fields["turnover_rate"],
-            arrays["volume"],
-            float_shares,
-        )
+            # 非股票资产 (etf/index) 无股本数据: instruments 无 float_shares 列,
+            # 也无法从 parquet 读到 turnover_rate (数据源不提供, ETF 无换手率口径)。
+            # 此时矩阵中该字段保持全 NaN 列 (matrix_fields 已占位), 与运行期
+            # _optional_field 的降级语义一致, 供不需要换手率的策略正常回测。
+            # 若本应有股本 (vector_fields 含 float_shares) 却取不到值, 才是数据
+            # 异常, 由 _resolve_matrix_storage_fields 的 vector 装载路径显式失败。
+            if "float_shares" in vector_fields:
+                raise ValueError("matrix turnover_rate requires float_shares")
+            logger.debug(
+                "turnover_rate unavailable (asset has no float_shares); keeping NaN column"
+            )
+        else:
+            _write_turnover_rate_matrix(
+                fields["turnover_rate"],
+                arrays["volume"],
+                float_shares,
+            )
     return names, latest_limits
 
 
@@ -2302,11 +2316,14 @@ def build_market_matrix_from_signals(
     exit_delay_bars: int = 0,
     reference_price: np.ndarray | None = None,
     minute_exit_trigger: bool = False,
+    entry_price_override: np.ndarray | None = None,
 ) -> MarketMatrix:
     """Combine base data and strategy signals into the matcher input matrix."""
     if entry_delay_bars not in (0, 1) or exit_delay_bars not in (0, 1):
         raise ValueError("phase-two MarketMatrix supports only zero or one bar delay")
     validate_signal_matrix(signals, market.shape)
+    if entry_price_override is not None and entry_price_override.shape != market.shape:
+        raise ValueError("entry_price_override shape does not match MarketDataMatrix")
 
     present = _present_matrix(market.open, market.high, market.low, market.close, market.volume)
     entry, entry_signal_time, entry_signal_code = _delay_signal_matrix(
@@ -2379,6 +2396,11 @@ def build_market_matrix_from_signals(
         exit_signal_code=exit_signal_code,
         entry_signal_ids=signals.entry_signal_ids,
         exit_signal_ids=signals.exit_signal_ids,
+        entry_price=(
+            np.array(entry_price_override, dtype=np.float32, copy=True)
+            if entry_price_override is not None
+            else None
+        ),
     )
 
 

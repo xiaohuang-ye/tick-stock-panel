@@ -386,6 +386,21 @@ def _realtime_allowed() -> bool:
     return QuoteService.is_realtime_allowed()
 
 
+def _minute_history_days() -> int | None:
+    """当前分钟源的 1 分钟历史深度(交易日); None = 深历史(tickflow 基准)。
+
+    provider 可选类属性 minute_history_days 声明 (如 stock-sdk = 5,
+    免费分时接口只保留最近 5 个交易日); 未声明或走 tickflow 时视为深历史。
+    前端分时档位/默认值据此收窄。
+    """
+    from app.services import kline_sync, preferences
+    provider_name = preferences.get_minute_data_provider()
+    provider, fallback, _err = kline_sync._resolve_minute_provider(provider_name)
+    if fallback or provider is None:
+        return None
+    return getattr(provider, "minute_history_days", None)
+
+
 class MinuteSyncPrefs(BaseModel):
     minute_sync_enabled: bool
     minute_sync_days: int = 5
@@ -397,6 +412,8 @@ class DataProvidersIn(BaseModel):
     daily_data_provider: str | None = None
     adj_factor_provider: str | None = None
     minute_data_provider: str | None = None
+    full_minute_data_provider: str | None = None
+    depth5_data_provider: str | None = None
     realtime_data_provider: str | None = None
     financial_data_provider: str | None = None
 
@@ -409,6 +426,14 @@ class PluginKeyIn(BaseModel):
 class DataSourceJobTimeoutPrefs(BaseModel):
     data_source_job_timeout_s: int = Field(ge=60)
     data_source_long_job_timeout_s: int = Field(ge=60)
+
+
+class MinuteBatchCompressPrefs(BaseModel):
+    minute_batch_compress: bool
+
+
+class DailyBatchCompressPrefs(BaseModel):
+    daily_batch_compress: bool
 
 
 class DatasetFieldMapItem(BaseModel):
@@ -473,19 +498,24 @@ def get_preferences() -> dict:
     return {
         "realtime_quotes_enabled": preferences.get_realtime_quotes_enabled(),
         "realtime_allowed": _realtime_allowed(),
-        "indices_nav_pinned": preferences.get_indices_nav_pinned(),
         "watchlist_groups_in_nav": preferences.get_watchlist_groups_in_nav(),
         "minute_sync_enabled": preferences.get_minute_sync_enabled(),
         "minute_sync_days": preferences.get_minute_sync_days(),
         "minute_sync_segment_days": preferences.get_minute_sync_segment_days(),
+        "minute_refresh_enabled": preferences.get_minute_refresh_enabled(),
+        "minute_refresh_interval": preferences.get_minute_refresh_interval(),
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
         "minute_data_provider": preferences.get_minute_data_provider(),
+        "full_minute_data_provider": preferences.get_full_minute_data_provider(),
+        "minute_history_days": _minute_history_days(),
+        "depth5_data_provider": preferences.get_depth5_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
         "data_source_job_timeout_s": preferences.get_data_source_job_timeout_s(),
         "data_source_long_job_timeout_s": preferences.get_data_source_long_job_timeout_s(),
-        "realtime_watchlist_symbols": preferences.get_realtime_watchlist_symbols(),
+        "minute_batch_compress": preferences.get_minute_batch_compress(),
+        "daily_batch_compress": preferences.get_daily_batch_compress(),
         **preferences.get_realtime_quote_scope(),
         "pipeline_pull_a_share": preferences.get_pipeline_pull_a_share(),
         "pipeline_pull_etf": preferences.get_pipeline_pull_etf(),
@@ -512,7 +542,6 @@ def get_preferences() -> dict:
         "wecom_bot_enabled": preferences.get_wecom_bot_enabled(),
         "webhook_enabled_default": preferences.get_webhook_enabled_default(),
         "webhook_default_channels": preferences.get_webhook_default_channels(),
-        "sidebar_index_symbols": preferences.get_sidebar_index_symbols(),
         "minute_intraday_refresh": preferences.get_minute_intraday_refresh(),
         "minute_intraday_refresh_interval": preferences.get_minute_intraday_refresh_interval(),
         "monitor_ext_fields": preferences.get_monitor_ext_fields(),
@@ -539,6 +568,31 @@ def list_data_sources() -> dict:
         "errors": custom_sources.errors(),
         "config_dir": str(custom_sources.data_sources_dir()),
     }
+
+
+@router.get("/capability-matrix")
+def get_capability_matrix() -> dict:
+    """能力 x 源路由矩阵: 能力注册表 + 各源能力声明 + 当前路由偏好, 设置页一次拉全。
+
+    偏好值经 preferences getters 注入 (自带合法源校验, 非法值回退默认),
+    TickFlow 当前档位由 tickflow policy 注入 (候选按档位过滤),
+    组装逻辑在 data_providers.capabilities, 本层保持薄。
+    """
+    from app.data_providers.capabilities import build_capability_matrix
+    from app.services import preferences
+    from app.tickflow import policy
+
+    return build_capability_matrix(
+        {
+            "realtime_data_provider": preferences.get_realtime_data_provider(),
+            "daily_data_provider": preferences.get_daily_data_provider(),
+            "minute_data_provider": preferences.get_minute_data_provider(),
+            "depth5_data_provider": preferences.get_depth5_data_provider(),
+            "adj_factor_provider": preferences.get_adj_factor_provider(),
+            "financial_data_provider": preferences.get_financial_provider(),
+        },
+        tickflow_tier=policy.base_tier_name(),
+    )
 
 
 @router.post("/plugin-key")
@@ -687,9 +741,8 @@ def delete_data_source(name: str, request: Request) -> dict:
         updates["realtime_data_provider"] = "tickflow"
     if preferences.get_financial_provider() == name:
         updates["financial_data_provider"] = "tickflow"
-    adj = preferences.get_adj_factor_provider()
-    if adj == name:
-        updates["adj_factor_provider"] = "same_as_daily"
+    if preferences.get_adj_factor_provider() == name:
+        updates["adj_factor_provider"] = "tickflow"
     if updates:
         preferences.save(updates)
     # 删除源可能触发偏好回退 tickflow, 同步刷新能力快照
@@ -735,6 +788,8 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
         "minute_data_provider": preferences.get_minute_data_provider(),
+        "full_minute_data_provider": preferences.get_full_minute_data_provider(),
+        "depth5_data_provider": preferences.get_depth5_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
     }
@@ -746,6 +801,22 @@ def update_data_source_job_timeouts(req: DataSourceJobTimeoutPrefs) -> dict:
     from app.services import preferences
     preferences.save(req.model_dump())
     return req.model_dump()
+
+
+@router.put("/preferences/minute-batch-compress")
+def update_minute_batch_compress(req: MinuteBatchCompressPrefs) -> dict:
+    """保存分时批量响应的 gzip 传输压缩开关。逐请求即时读取, 保存后立即生效。"""
+    from app.services import preferences
+    preferences.save({"minute_batch_compress": req.minute_batch_compress})
+    return {"minute_batch_compress": preferences.get_minute_batch_compress()}
+
+
+@router.put("/preferences/daily-batch-compress")
+def update_daily_batch_compress(req: DailyBatchCompressPrefs) -> dict:
+    """保存日K批量响应的 gzip 传输压缩开关 (与分时独立)。逐请求即时读取。"""
+    from app.services import preferences
+    preferences.save({"daily_batch_compress": req.daily_batch_compress})
+    return {"daily_batch_compress": preferences.get_daily_batch_compress()}
 
 
 @router.put("/preferences/mining-schedule")
@@ -841,6 +912,15 @@ def update_minute_sync(req: MinuteSyncPrefs) -> dict:
     }
 
 
+@router.get("/minute-refresh/status")
+def minute_refresh_status(request: Request) -> dict:
+    """盘中分钟增量刷新服务状态 (开关/能力门控/最近一轮/下一轮)。"""
+    svc = getattr(request.app.state, "minute_refresh", None)
+    if svc is None:
+        return {"available": False}
+    return {"available": True, **svc.status()}
+
+
 class RealtimeQuotesPrefs(BaseModel):
     realtime_quotes_enabled: bool
 
@@ -848,17 +928,14 @@ class RealtimeQuotesPrefs(BaseModel):
 class RealtimeQuoteScopePrefs(BaseModel):
     realtime_pull_stock: bool | None = None
     realtime_pull_etf: bool | None = None
-    realtime_pull_index: bool | None = None
-    realtime_index_mode: str | None = None
-    realtime_index_symbols: list[str] | None = None
 
 
 @router.put("/preferences/realtime-quotes")
 def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
     """保存全局实时行情开关。
 
-    none 档无实时行情权限；free 档开启自选股实时；starter+ 开启全市场实时。
-    前端据此把开关置灰 / 回弹。
+    无实时能力的档位(TickFlow none/free)开关回弹强制关闭;
+    starter+ 或自定义实时源(如 fuyao)为全市场实时。前端据此把开关置灰 / 回弹。
     """
     from app.services import preferences
     qs = getattr(request.app.state, "quote_service", None)
@@ -884,6 +961,16 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
             qs.disable()
         _sync_depth_polling(False)
         return {"realtime_quotes_enabled": False, "realtime_allowed": False}
+    if req.realtime_quotes_enabled:
+        # 首用门禁: 本地完全无数据 (日K/enriched 均空, 与看板首用弹窗同口径) 时
+        # 禁止开启 — 实时行情的展示 (enriched 底座 + 快照覆盖)、监控、连板梯队
+        # 全部依赖本地数据, 空数据下轮询只是空转耗配额, 且无 instruments 维表。
+        repo = getattr(request.app.state, "repo", None)
+        if repo is not None and repo.latest_daily_date() is None and repo.latest_enriched_date() is None:
+            raise HTTPException(
+                status_code=409,
+                detail="本地暂无行情数据，请先在「数据」页同步后再开启实时行情",
+            )
     if req.realtime_quotes_enabled and qs and qs.is_paused():
         # 管道/数据修正运行期间禁止开启实时行情 — 防止写盘竞态
         raise HTTPException(status_code=409, detail="数据同步运行中，实时行情已临时暂停，请稍后再开启")
@@ -912,10 +999,6 @@ def update_realtime_quotes(req: RealtimeQuotesPrefs, request: Request) -> dict:
                         + f"（任务 {job_id}）"
                     )
                     raise HTTPException(status_code=409, detail=detail)
-    if req.realtime_quotes_enabled and qs and qs.realtime_mode() == "watchlist" and not preferences.get_realtime_watchlist_symbols():
-        preferences.save({"realtime_quotes_enabled": False})
-        _sync_depth_polling(False)
-        return {"realtime_quotes_enabled": False, "realtime_allowed": True, "mode": "watchlist", "error": "watchlist_empty"}
 
     preferences.save({"realtime_quotes_enabled": req.realtime_quotes_enabled})
     if qs:
@@ -936,31 +1019,6 @@ def update_realtime_quote_scope(req: RealtimeQuoteScopePrefs) -> dict:
     return preferences.set_realtime_quote_scope(cfg)
 
 
-class RealtimeWatchlistPrefs(BaseModel):
-    symbols: list[str] = []
-
-
-@router.put("/preferences/realtime-watchlist")
-def update_realtime_watchlist(req: RealtimeWatchlistPrefs) -> dict:
-    """兼容旧入口；Free 实时标的由自选页前 5 个决定。"""
-    from app.services import preferences
-    symbols = preferences.set_realtime_watchlist_symbols(req.symbols)
-    return {"realtime_watchlist_symbols": symbols}
-
-
-class IndicesNavPinnedPrefs(BaseModel):
-    indices_nav_pinned: bool
-
-
-@router.put("/preferences/indices-nav-pinned")
-def update_indices_nav_pinned(req: IndicesNavPinnedPrefs) -> dict:
-    """保存侧栏指数报价卡片固定显示开关。
-    ON=常驻显示；OFF=跟随实时行情开关（仅实时开时显示）。"""
-    from app.services import preferences
-    preferences.save({"indices_nav_pinned": req.indices_nav_pinned})
-    return {"indices_nav_pinned": req.indices_nav_pinned}
-
-
 class WatchlistGroupsInNavPrefs(BaseModel):
     watchlist_groups_in_nav: bool
 
@@ -977,10 +1035,12 @@ class RealtimeMonitorConfigIn(BaseModel):
     sse_refresh_pages: dict[str, bool] | None = None
     strategy_monitor_enabled: bool | None = None
     strategy_monitor_ids: list[str] | None = None
-    sidebar_index_symbols: list[str] | None = None
     screener_auto_run: bool | None = None
     minute_intraday_refresh: bool | None = None
     minute_intraday_refresh_interval: int | None = None
+    # 盘中分钟增量落盘 (Expert 专有) — 交易时段常驻服务, 归实时监控配置
+    minute_refresh_enabled: bool | None = None
+    minute_refresh_interval: int | None = None
     monitor_ext_fields: dict | None = None
 
 
@@ -1170,6 +1230,46 @@ def update_wecom_webhook(req: WecomWebhookPrefsIn) -> dict:
         )
     saved_url = preferences.set_wecom_webhook_url(url)
     return {"wecom_webhook_url": saved_url}
+
+
+class WebhookTestIn(BaseModel):
+    channel: Literal["feishu", "wecom"]
+
+
+@router.post("/preferences/webhook-test")
+def test_webhook(req: WebhookTestIn) -> dict:
+    """向已保存的 Webhook 地址发送一条测试消息，验证配置是否正确。
+
+    只测试已保存的配置（与生产推送同源），不测试未保存草稿。
+    未配置 / 地址非法 / 发送失败均返回 HTTP 200 + {ok: False}，
+    前端统一读 detail 渲染绿/红，不抛 400。
+    """
+    from app.services import preferences
+    from app.services import webhook_adapter
+
+    title = "TickFlow Stock Panel 推送测试"
+    body = "如果你看到这条消息，说明推送配置正确 🎉"
+
+    if req.channel == "feishu":
+        url = preferences.get_feishu_webhook_url()
+        if not url:
+            return {"ok": False, "detail": "尚未配置飞书 Webhook，请先保存"}
+        if not webhook_adapter.is_valid_feishu_url(url):
+            return {"ok": False, "detail": "已保存的飞书 Webhook 地址非法，请重新保存"}
+        secret = preferences.get_feishu_webhook_secret()
+        # 诊断用途单次尝试: 失败即返回, 不等生产退避重试 (~17s)
+        ok = webhook_adapter.send_feishu(url, title, body, secret, max_attempts=1)
+    else:  # wecom
+        url = preferences.get_wecom_webhook_url()
+        if not url:
+            return {"ok": False, "detail": "尚未配置企业微信 Webhook，请先保存"}
+        if not webhook_adapter.is_valid_wecom_url(url):
+            return {"ok": False, "detail": "已保存的企业微信 Webhook 地址非法，请重新保存"}
+        ok = webhook_adapter.send_wecom(url, title, body)
+
+    if ok:
+        return {"ok": True, "detail": "测试消息已发送，请到群内查收"}
+    return {"ok": False, "detail": "推送失败：网络不可达或地址/密钥不正确，详情见后端日志"}
 
 
 class WecomBotPrefsIn(BaseModel):
