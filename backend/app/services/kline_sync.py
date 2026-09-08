@@ -7,7 +7,11 @@
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import shutil
+import time
+import uuid
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
 
@@ -177,6 +181,17 @@ def sync_and_persist_daily_batch(
             end_time = end_date or datetime.now()
             days = count or 365
             start_time = start_date or (end_time - timedelta(days=days))
+            iter_daily = getattr(provider, "iter_daily", None)
+            if callable(iter_daily):
+                return _persist_daily_chunks(
+                    iter_daily(
+                        symbols,
+                        start_time=start_time,
+                        end_time=end_time,
+                        on_chunk_done=on_chunk_done,
+                    ),
+                    repo,
+                )
             df = provider.get_daily(
                 symbols,
                 start_time=start_time,
@@ -226,6 +241,49 @@ def sync_and_persist_daily_batch(
         logger.warning("refresh view failed: %s", e)
 
     return df.height
+
+
+def _persist_daily_chunks(chunks, repo: KlineRepository) -> int:
+    """先把流式 provider 结果写入私有 staging,完整取数后再提交正式分区。"""
+    staging_base = repo.store.data_dir / ".daily_sync_staging"
+    _sweep_stale_daily_staging(staging_base)
+    root = staging_base / uuid.uuid4().hex
+    written = 0
+    try:
+        for index, df in enumerate(chunks):
+            if df.is_empty():
+                continue
+            for date_df in df.partition_by("date"):
+                dt = date_df["date"][0]
+                ds = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+                out = root / f"date={ds}" / f"part-{index}.parquet"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                date_df.write_parquet(out)
+                written += date_df.height
+
+        for date_dir in sorted(root.glob("date=*")):
+            files = sorted(date_dir.glob("*.parquet"))
+            if files:
+                repo.append_daily(pl.scan_parquet(files).collect(engine="streaming"))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            root.parent.rmdir()
+
+    return written
+
+
+def _sweep_stale_daily_staging(staging_base, max_age_s: int = 24 * 60 * 60) -> None:
+    """清理崩溃遗留的旧同步目录,不碰仍可能活跃的新目录。"""
+    if not staging_base.exists():
+        return
+    cutoff = time.time() - max_age_s
+    for run_dir in staging_base.iterdir():
+        try:
+            if run_dir.is_dir() and run_dir.stat().st_mtime < cutoff:
+                shutil.rmtree(run_dir)
+        except OSError:
+            logger.warning("failed to clean stale daily staging: %s", run_dir)
 
 
 def sync_daily_by_quotes(repo: KlineRepository) -> int:
@@ -703,10 +761,8 @@ def _try_custom_minute(
       (None, True)   → 未配自定义源 / 未配 minute dataset / 自定义源异常 → 走 TickFlow
       (df, False)    → 自定义源成功(含空 df) → 直接用, 不回退
 
-    降级策略 (C): 自定义源异常时无条件 fall through 到 TickFlow,
-    由 TickFlow 路径自身 try/except 兜底。Pro+ 用户 TickFlow 成功返回数据,
-    None 档用户 TickFlow 失败返回空。不显式判断 tier, 避免 #126 augmented
-    capability 逻辑干扰。
+    自定义源异常时返回 fallback=True。单股拉取调用方另行检查 TickFlow 原生
+    能力, 避免自定义源增广能力误放行无权限请求。
 
     resolver 异常边界由 _resolve_minute_provider 统一兜底; 业务调用
     (provider.get_minute) 仍在本函数 try 块内, 与 resolver 异常分离
@@ -1162,8 +1218,14 @@ def fetch_minute_single(
     symbol: str,
     trade_date: date,
     asset_type: AssetType = "stock",
+    *,
+    capset: CapabilitySet,
 ) -> pl.DataFrame:
-    """实时拉取单股单日分钟 K(不写入本地)。优先自定义分钟源, 回退 TickFlow。"""
+    """实时拉取单股单日分钟 K(不写入本地)。
+
+    优先使用当前自定义分钟源。仅当 TickFlow 原生单股分钟能力存在时才允许
+    回退 TickFlow; 自定义源增广只授予 batch 能力, 不会误放行该回退路径。
+    """
     from datetime import datetime
     # 北京时间窗口必须带时区: naive datetime 会被 .timestamp() 按服务器本地时区解释,
     # UTC 容器上窗口整体偏移 8 小时, 分时补拉必然为空。
@@ -1179,6 +1241,9 @@ def fetch_minute_single(
     if not fallback:
         # 见 sync_minute_batch 同分支注释: df 在此必非 None。
         return df if df is not None else pl.DataFrame()
+
+    if not capset.has(Cap.KLINE_MINUTE_BY_SYMBOL):
+        return pl.DataFrame()
 
     tf = get_client()
     try:
