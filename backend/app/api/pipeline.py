@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures as _cf
 import logging
+from contextlib import nullcontext
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -14,7 +15,7 @@ from app.services.pipeline_jobs import (
     release_run_slot,
     try_acquire_run_slot,
 )
-from app.api.data import invalidate_storage_cache
+from app.api.data import invalidate_storage_cache, refresh_repo_cache_safely
 
 # 长时间任务专用线程池（隔离于 FastAPI 默认线程池，防止阻塞请求处理）
 _long_task_executor = _cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="long-task")
@@ -60,19 +61,26 @@ async def run_now(request: Request) -> dict:
                 job_store.progress(job_id, stage, pct, msg, stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
-                if qs:
-                    with qs.paused():
+                # 刷新放 paused 上下文内的 finally: 成功/取消/异常三种终态都必须
+                # 把已落盘数据刷进 Polars 内存快照(否则读路径继续返回旧缓存,
+                # 用户只能重启); 且不能与实时行情写分区并发 —— 刷新期间的
+                # enriched 写入会 bump generation, 令 refresh_cache 半途放弃。
+                # 整段在 executor 线程执行, 不阻塞事件循环。
+                ctx = qs.paused() if qs else nullcontext()
+                with ctx:
+                    try:
                         return daily_pipeline.run_now(repo, capset, on_progress=progress)
-                return daily_pipeline.run_now(repo, capset, on_progress=progress)
+                    finally:
+                        refresh_repo_cache_safely(repo)
 
             result = await loop.run_in_executor(_long_task_executor, _run)
             job_store.succeed(job_id, result)
             invalidate_storage_cache()
-            repo.refresh_cache()  # 刷新 Polars 缓存
         except JobCancelledError:
             # 已被 reap/手动取消终止: job 状态已由 terminate() 写为 failed,
             # 拉取线程在分块回调处自行退出, 这里无需(也无法)再写状态。
             logger.warning("pipeline job %s cancelled", job_id)
+            invalidate_storage_cache()
         except Exception as e:  # noqa: BLE001
             logger.exception("pipeline failed")
             job_store.fail(job_id, str(e))

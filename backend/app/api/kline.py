@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import re
+from contextlib import nullcontext
 from datetime import date, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -1024,6 +1025,9 @@ def sync_symbol(
     repo = request.app.state.repo
     capset = request.app.state.capabilities
     n = kline_sync.sync_and_persist_daily_batch([symbol], repo, capset, count=days)
+    if n:
+        from app.api.data import invalidate_storage_cache
+        invalidate_storage_cache()
     return {"symbol": symbol, "rows_written": n}
 
 
@@ -1036,6 +1040,9 @@ def sync_batch(
     repo = request.app.state.repo
     capset = request.app.state.capabilities
     n = kline_sync.sync_and_persist_daily_batch(symbols, repo, capset, count=days)
+    if n:
+        from app.api.data import invalidate_storage_cache
+        invalidate_storage_cache()
     return {"symbols": symbols, "rows_written": n}
 
 
@@ -1115,7 +1122,7 @@ async def sync_symbols(request: Request):
 
         from app.jobs import daily_pipeline
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
-        from app.api.data import invalidate_storage_cache
+        from app.api.data import invalidate_storage_cache, refresh_repo_cache_safely
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1134,20 +1141,21 @@ async def sync_symbols(request: Request):
                                    stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
-                # 同步运行期间暂停实时行情, 防止覆写同一批 parquet 竞态
-                if qs:
-                    with qs.paused():
+                # 暂停实时行情防分区写竞态; 刷新放 paused 内的 finally:
+                # 成功/取消/异常终态都要把已落盘数据刷进内存快照(对齐 /api/pipeline/run)
+                ctx = qs.paused() if qs else nullcontext()
+                with ctx:
+                    try:
                         return daily_pipeline.run_symbols_sync(
                             repo, capset, symbols, days=days, on_progress=progress)
-                return daily_pipeline.run_symbols_sync(
-                    repo, capset, symbols, days=days, on_progress=progress)
+                    finally:
+                        refresh_repo_cache_safely(repo)
 
             try:
                 job_store.start(job_id)
                 result = await loop.run_in_executor(_long_task_executor, _run)
                 job_store.succeed(job_id, result)
                 invalidate_storage_cache()
-                repo.refresh_cache()
             except JobCancelledError:
                 # 已由 terminate() 标记失败, 拉取线程在分块回调处自行退出
                 invalidate_storage_cache()
@@ -1391,7 +1399,7 @@ async def extend_history(request: Request):
 
         from app.services.extend_history import run_extend_history
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
-        from app.api.data import invalidate_storage_cache
+        from app.api.data import invalidate_storage_cache, refresh_repo_cache_safely
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1402,18 +1410,26 @@ async def extend_history(request: Request):
                 job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
                 return
             loop = asyncio.get_event_loop()
+            qs = getattr(request.app.state, "quote_service", None)
 
             def progress(stage: str, pct: int, msg: str,
                          stage_pct: int | None = None, skip_log: bool = False) -> None:
                 job_store.progress(job_id, stage, pct, msg,
                                    stage_pct=stage_pct, skip_log=skip_log)
 
+            def _run() -> dict:
+                # 与 repair_daily 对齐: 暂停实时行情防分区写竞态; 刷新放 finally,
+                # 部分失败时已落盘的数据同样要进内存快照
+                ctx = qs.paused() if qs else nullcontext()
+                with ctx:
+                    try:
+                        return run_extend_history(repo, capset, value, unit, on_progress=progress)
+                    finally:
+                        refresh_repo_cache_safely(repo)
+
             try:
                 job_store.start(job_id)
-                result = await loop.run_in_executor(
-                    _long_task_executor,
-                    lambda: run_extend_history(repo, capset, value, unit, on_progress=progress),
-                )
+                result = await loop.run_in_executor(_long_task_executor, _run)
                 if "error" in result:
                     job_store.fail(job_id, result["error"])
                 else:
@@ -1473,7 +1489,7 @@ async def repair_daily(request: Request):
 
         from app.services.repair_daily import run_repair_daily
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
-        from app.api.data import invalidate_storage_cache
+        from app.api.data import invalidate_storage_cache, refresh_repo_cache_safely
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1492,11 +1508,15 @@ async def repair_daily(request: Request):
                                    stage_pct=stage_pct, skip_log=skip_log)
 
             def _run() -> dict:
-                # 修正运行期间暂停实时行情, 防止覆写同一批 parquet 竞态
-                if qs:
-                    with qs.paused():
+                # 修正运行期间暂停实时行情, 防止覆写同一批 parquet 竞态;
+                # 刷新放 paused 内的 finally: run_now 内部只刷视图和画像缓存,
+                # 不重建 Polars 快照, 部分失败时已落盘数据同样要进内存快照
+                ctx = qs.paused() if qs else nullcontext()
+                with ctx:
+                    try:
                         return run_repair_daily(repo, capset, start_date, on_progress=progress)
-                return run_repair_daily(repo, capset, start_date, on_progress=progress)
+                    finally:
+                        refresh_repo_cache_safely(repo)
 
             try:
                 job_store.start(job_id)
@@ -1536,7 +1556,7 @@ async def rebuild_enriched(request: Request):
         repo = request.app.state.repo
 
         from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, try_acquire_run_slot
-        from app.api.data import invalidate_storage_cache
+        from app.api.data import invalidate_storage_cache, refresh_repo_cache_safely
 
         job_id, is_new = job_store.create()
         if not is_new:
@@ -1547,6 +1567,7 @@ async def rebuild_enriched(request: Request):
                 job_store.fail(job_id, "已有数据任务在运行(或上一次任务卡死未结束),请稍后再试")
                 return
             loop = asyncio.get_event_loop()
+            qs = getattr(request.app.state, "quote_service", None)
 
             def progress(stage: str, pct: int, msg: str,
                          stage_pct: int | None = None, skip_log: bool = False) -> None:
@@ -1564,10 +1585,18 @@ async def rebuild_enriched(request: Request):
                              f"计算指标 批次 {cur}/{tot}",
                              stage_pct=int(100 * cur / tot), skip_log=True)
 
-                written = await loop.run_in_executor(
-                    _long_task_executor,
-                    lambda: run_pipeline(on_batch_done=_batch_progress),
-                )
+                def _run() -> int:
+                    # 重写全部 enriched 分区, 暂停实时行情防分区写竞态;
+                    # 刷新放 finally: 重建后内存快照必须跟上, 否则 K线/自选/选股
+                    # 继续读旧数据直到重启
+                    ctx = qs.paused() if qs else nullcontext()
+                    with ctx:
+                        try:
+                            return run_pipeline(on_batch_done=_batch_progress)
+                        finally:
+                            refresh_repo_cache_safely(repo)
+
+                written = await loop.run_in_executor(_long_task_executor, _run)
 
                 enriched_dir = repo.store.data_dir / "kline_daily_enriched"
                 enriched_days = len(list(enriched_dir.glob("date=*"))) if enriched_dir.exists() else 0

@@ -79,6 +79,19 @@ def invalidate_storage_cache() -> None:
     invalidate_data_cache(None)
 
 
+def refresh_repo_cache_safely(repo) -> None:
+    """job 终态刷新 Polars 内存快照, 失败只记日志, 不改变 job 终态。
+
+    应在写入方暂停(quote_service.paused)上下文内调用: 刷新期间的 enriched
+    写入会 bump generation, 令 refresh_cache 半途放弃, 内存快照停留在旧数据
+    (表现为"同步后要重启才生效")。
+    """
+    try:
+        repo.refresh_cache()
+    except Exception:
+        logger.exception("repo.refresh_cache failed")
+
+
 def _get_table_stats(name: str, fetch: Callable[[], dict | None]) -> dict | None:
     """走 TTL+事件 双重缓存。fetch 在锁外执行避免阻塞别的请求。"""
     ttl = _TABLE_TTL_LARGE if name in _LARGE_TABLES else _TABLE_TTL
