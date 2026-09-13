@@ -10,14 +10,17 @@ Original implementation by @forrany (PR #57), migrated to plugin architecture.
 from __future__ import annotations
 
 import logging
+import math
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from datetime import time as dtime
 
 import polars as pl
 
-from app.data_providers.base import AssetType
+from app.data_providers.base import AssetType, UpstreamThrottledError
 from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
 from app.plugins.stocksdk import bridge
 from app.tickflow.rate_limits import chunked
@@ -29,7 +32,99 @@ _DATASETS = ("daily", "adj_factor", "minute", "realtime")
 
 # 每次桥接调用的符号数。桥接内部按 concurrency 并发, 分批仅为进度反馈与超时控制。
 _BATCH = 40
+# 批内逐 symbol 抓取的并发数(透传给 bridge.mjs)。对东财免费接口的限流风险随
+# 此值与 _PARALLEL_BRIDGE 线性上升, 实测大量空结果/失败批次时应下调。
+_CONCURRENCY = 12
+# 同时在飞的桥接子进程数(每批各自 spawn node, 相互无共享状态)。
+_PARALLEL_BRIDGE = 2
+# 单批桥接超时(秒)。批大小 40、批内并发 12 后单批最耗时约 2 分钟, 留一倍余量。
+_TIMEOUT_DAILY = 360
+_TIMEOUT_ADJ = 480
+_TIMEOUT_MINUTE = 360
+# ex_factor 合理上限。真实除权因子几十年累积也在千级以内; 上游行情错位时会算出
+# 1e26 级脏值(实测), 写入 enriched 后会让 polars f64→i64 严格转换崩溃,
+# 必须在数据边界丢弃。
+_EX_FACTOR_LIMIT = 1e6
+# 熔断: 连续 N 批完全空结果(限流的典型形态)即中止剩余批次并抛 UpstreamThrottledError。
+# 实测被限流时每批仍要 1~2 分钟, 不熔断会空转近一小时且零数据返回, 还与「无新增」混淆。
+_EMPTY_BREAK_CHUNKS = 4
+# 熔断仅对窗口含近 N 天的拉取启用: 历史补数据(extend_history 拉早年)窗口里大量
+# 当日未上市标的空返回是正常形态, 不能据以判定限流。
+_EMPTY_BREAK_RECENT_DAYS = 7
+
 _MINUTE_CANONICAL = ["symbol", "datetime", "open", "high", "low", "close", "volume", "amount"]
+
+
+def _sane_ex_factor(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    v = float(value)
+    return math.isfinite(v) and 0.0 < v <= _EX_FACTOR_LIMIT
+
+
+def _is_recent_window(end_time: datetime | None) -> bool:
+    if end_time is None:
+        return True
+    return (datetime.now() - end_time).days <= _EMPTY_BREAK_RECENT_DAYS
+
+
+def _execute_chunks(
+    chunks: list[list],
+    worker: Callable[[list], list[pl.DataFrame]],
+    on_chunk_done: Callable[[int, int], None] | None,
+    empty_break_after: int | None = None,
+) -> list[pl.DataFrame]:
+    """以 _PARALLEL_BRIDGE 并发执行各批桥接调用, 返回全部非空帧。
+
+    每批是独立 node 子进程, 批间无共享状态; 进度按「已完成批数」单调回调。
+    某批抛出(含任务取消经回调传播)时置停止标记: 未开始的批次直接跳过,
+    已在飞批次等待自然结束(与原串行行为一致)。
+    empty_break_after: 连续 N 批完全空结果(限流形态)时置停止标记, 等在飞
+    批次结束后抛 UpstreamThrottledError; None = 不启用。
+    """
+    total = len(chunks)
+    frames: list[pl.DataFrame] = []
+    if not total:
+        return frames
+    state = {"done": 0, "empty_streak": 0, "broken_streak": 0}
+    lock = threading.Lock()
+    cancelled = threading.Event()
+
+    def _run_one(chunk) -> list[pl.DataFrame]:
+        if cancelled.is_set():
+            return []
+        part = worker(chunk)
+        # 计数与回调同锁, 保证多批并行时进度回调仍单调递增
+        with lock:
+            state["done"] += 1
+            if part:
+                state["empty_streak"] = 0
+            elif empty_break_after:
+                state["empty_streak"] += 1
+                if state["empty_streak"] >= empty_break_after:
+                    state["broken_streak"] = state["empty_streak"]
+                    cancelled.set()
+            if on_chunk_done:
+                on_chunk_done(state["done"], total)
+        return part
+
+    max_workers = max(1, min(_PARALLEL_BRIDGE, total))
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        futures = [pool.submit(_run_one, chunk) for chunk in chunks]
+        for fut in as_completed(futures):
+            try:
+                frames.extend(fut.result())
+            except BaseException:
+                cancelled.set()
+                raise
+    finally:
+        pool.shutdown(wait=True)
+    if state["broken_streak"]:
+        raise UpstreamThrottledError(
+            f"连续 {state['broken_streak']} 批空结果(上游限流形态), 中止剩余 {total - state['done']} 批"
+        )
+    return frames
 
 
 @dataclass
@@ -74,29 +169,31 @@ class StockSDKProvider:
         if not symbols:
             return pl.DataFrame()
         logger.info("stock-sdk daily 拉取开始(%d symbols)", len(symbols))
-        frames: list[pl.DataFrame] = []
-        chunks = chunked(symbols, _BATCH)
-        for i, chunk in enumerate(chunks):
+
+        def worker(chunk: list[str]) -> list[pl.DataFrame]:
             job = {
                 "op": "daily",
                 "symbols": chunk,
                 "adjust": "none",
                 "start": _yyyymmdd(start_time),
                 "end": _yyyymmdd(end_time),
+                "concurrency": _CONCURRENCY,
             }
             try:
-                result = bridge.run_job(job, timeout=180)
+                result = bridge.run_job(job, timeout=_TIMEOUT_DAILY)
             except bridge.StockSDKBridgeError as e:
                 logger.warning("stock-sdk daily 拉取失败(%d symbols): %s", len(chunk), e)
-                result = {"rows": {}}
+                return []
+            frames: list[pl.DataFrame] = []
             for sym, rows in (result.get("rows") or {}).items():
                 if not rows:
                     continue
                 df = normalize_daily(rows, default_symbol=sym, source=self.name)
                 if not df.is_empty():
                     frames.append(df)
-            if on_chunk_done:
-                on_chunk_done(i + 1, len(chunks))
+            return frames
+
+        frames = _execute_chunks(chunked(symbols, _BATCH), worker, on_chunk_done)
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     # ---- adj_factor ----
@@ -110,29 +207,40 @@ class StockSDKProvider:
     ) -> pl.DataFrame:
         if not symbols:
             return pl.DataFrame()
-        frames: list[pl.DataFrame] = []
-        chunks = chunked(symbols, _BATCH)
-        for i, chunk in enumerate(chunks):
+        # 熔断仅对含近几天的窗口启用(历史补数据窗口的空返回是正常形态)
+        breaker = _EMPTY_BREAK_CHUNKS if _is_recent_window(end_time) else None
+
+        def worker(chunk: list[str]) -> list[pl.DataFrame]:
             job = {
                 "op": "adj",
                 "symbols": chunk,
                 "start": _yyyymmdd(start_time),
                 "end": _yyyymmdd(end_time),
+                "concurrency": _CONCURRENCY,
             }
             try:
-                result = bridge.run_job(job, timeout=240)
+                result = bridge.run_job(job, timeout=_TIMEOUT_ADJ)
             except bridge.StockSDKBridgeError as e:
                 logger.warning("stock-sdk adj 拉取失败(%d symbols): %s", len(chunk), e)
-                result = {"rows": {}}
+                return []
             flat: list[dict] = []
             for rows in (result.get("rows") or {}).values():
                 flat.extend(rows or [])
-            if flat:
-                df = normalize_adj_factors(flat, source=self.name)
-                if not df.is_empty():
-                    frames.append(df)
-            if on_chunk_done:
-                on_chunk_done(i + 1, len(chunks))
+            if not flat:
+                return []
+            sane = [r for r in flat if _sane_ex_factor(r.get("ex_factor"))]
+            if len(sane) < len(flat):
+                logger.warning(
+                    "stock-sdk adj 丢弃 %d 条异常除权因子(非有限/<=0/>%.0e), 防止污染 enriched",
+                    len(flat) - len(sane), _EX_FACTOR_LIMIT,
+                )
+            if not sane:
+                return []
+            df = normalize_adj_factors(sane, source=self.name)
+            return [df] if not df.is_empty() else []
+
+        frames = _execute_chunks(chunked(symbols, _BATCH), worker, on_chunk_done,
+                                 empty_break_after=breaker)
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()
 
     # ---- minute ----
@@ -177,31 +285,37 @@ class StockSDKProvider:
         else:
             windows.append((start_time, end_time))
 
-        frames: list[pl.DataFrame] = []
-        chunks = chunked(symbols, _BATCH)
-        total = len(chunks) * len(windows)
-        step = 0
-        for win_start, win_end in windows:
-            for chunk in chunks:
-                step += 1
-                job = {
-                    "op": "minute",
-                    "symbols": chunk,
-                    "period": period,
-                    "start": _yyyymmdd(win_start),
-                    "end": _yyyymmdd(win_end),
-                }
-                try:
-                    result = bridge.run_job(job, timeout=180)
-                except bridge.StockSDKBridgeError as e:
-                    logger.warning("stock-sdk minute 拉取失败(%d symbols): %s", len(chunk), e)
-                    result = {"rows": {}}
-                for sym, rows in (result.get("rows") or {}).items():
-                    df = self._minute_df(rows, sym)
-                    if not df.is_empty():
-                        frames.append(df)
-                if on_chunk_done:
-                    on_chunk_done(step, total)
+        # 窗口 × 批次展开成任务列表, 由 _execute_chunks 并行跑, 进度按
+        # 已完成任务数单调回调(与原串行的 step/total 口径一致)。
+        tasks = [
+            (win_start, win_end, chunk)
+            for win_start, win_end in windows
+            for chunk in chunked(symbols, _BATCH)
+        ]
+
+        def worker(task) -> list[pl.DataFrame]:
+            win_start, win_end, chunk = task
+            job = {
+                "op": "minute",
+                "symbols": chunk,
+                "period": period,
+                "start": _yyyymmdd(win_start),
+                "end": _yyyymmdd(win_end),
+                "concurrency": _CONCURRENCY,
+            }
+            try:
+                result = bridge.run_job(job, timeout=_TIMEOUT_MINUTE)
+            except bridge.StockSDKBridgeError as e:
+                logger.warning("stock-sdk minute 拉取失败(%d symbols): %s", len(chunk), e)
+                return []
+            out: list[pl.DataFrame] = []
+            for sym, rows in (result.get("rows") or {}).items():
+                df = self._minute_df(rows, sym)
+                if not df.is_empty():
+                    out.append(df)
+            return out
+
+        frames = _execute_chunks(tasks, worker, on_chunk_done)
         # 末窗口(最新一日)的真实 open 与首窗口可能重叠同日(时区/边界), keep="last"
         # 由上层 _write_minute_partition 的 unique 处理; 这里仅拼接。
         return pl.concat(frames, how="diagonal_relaxed") if frames else pl.DataFrame()

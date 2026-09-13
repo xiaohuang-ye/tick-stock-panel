@@ -9,8 +9,11 @@ import datetime as dt
 import json
 import shutil
 import subprocess
+import threading
+import time
 
 import polars as pl
+import pytest
 
 from app.plugins.stocksdk import bridge
 from app.plugins.stocksdk import provider as sp
@@ -333,3 +336,177 @@ def test_get_minute_single_day_no_split(monkeypatch):
     StockSDKProvider().get_minute(["600519.SH"], datetime(2026, 8, 28), datetime(2026, 8, 28, 15, 0))
     assert len(jobs) == 1
     assert jobs[0]["start"] == "20260828"
+
+
+# ===== 并行桥 + 熔断 + 脏值守卫 (upstream 简版上的本地增强重套管) =====
+
+
+def _daily_payload(job):
+    rows = {
+        s: [{"date": "2026-01-05", "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+             "volume": 1, "amount": 1.0, "code": s.split(".")[0]}]
+        for s in job["symbols"]
+    }
+    return {"ok": True, "op": "daily", "rows": rows}
+
+
+def test_get_daily_runs_two_bridges_in_parallel(monkeypatch):
+    """两个批次的桥接子进程应同时在飞, 且 concurrency 透传给 bridge.mjs。"""
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 2)]
+    state = {"active": 0, "max_active": 0}
+    lock = threading.Lock()
+    seen_concurrency = []
+
+    def fake(job, timeout=None):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            seen_concurrency.append(job.get("concurrency"))
+        time.sleep(0.2)
+        with lock:
+            state["active"] -= 1
+        return _daily_payload(job)
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    df = StockSDKProvider().get_daily(syms, None, None)
+
+    assert df.height == sp._BATCH * 2
+    assert state["max_active"] == sp._PARALLEL_BRIDGE
+    assert seen_concurrency == [sp._CONCURRENCY] * 2
+
+
+def test_on_chunk_done_counts_each_chunk_once(monkeypatch):
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 3)]
+    calls = []
+
+    def fake(job, timeout=None):
+        time.sleep(0.02)
+        return _daily_payload(job)
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    StockSDKProvider().get_daily(
+        syms, None, None, on_chunk_done=lambda i, n: calls.append((i, n)),
+    )
+
+    total = sp._BATCH * 3 // sp._BATCH
+    assert sorted(calls) == [(i, total) for i in range(1, total + 1)]
+    # 并行下进度必须单调递增, 不能出现 2 先于 1 的乱序回调
+    assert calls == sorted(calls)
+
+
+def test_chunk_failure_does_not_kill_other_chunks(monkeypatch):
+    """单批桥接失败只跳过该批, 其余批次照常落库。"""
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 2)]
+
+    def fake(job, timeout=None):
+        if "600000.SH" in job["symbols"]:
+            raise sp.bridge.StockSDKBridgeError("boom")
+        return _daily_payload(job)
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    df = StockSDKProvider().get_daily(syms, None, None)
+
+    assert df.height == sp._BATCH
+    assert "600000.SH" not in df["symbol"].unique().to_list()
+
+
+def test_adj_always_uses_op_adj_sparse_events(monkeypatch):
+    """除权一律走 op:adj 稀疏事件拉取, 不再用日K none 基线 + hfq 合成每日因子。
+
+    曾有的 hit_worker 基线合成产出的 ex_factor=close_hfq/close_none 是"后复权累计
+    比值"(每个交易日一行), 与事件表契约(单事件比值)不符, cum_prod 会把历史价压成
+    ~0 (2026-09 中天科技 0813 事故)。移除后即便同日历窗口先调过 get_daily,
+    除权阶段也必须发 op:adj, 不得发 hfq/adjust 或复用基线搞每日合成。
+    """
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        if job["op"] == "daily":
+            return {"ok": True, "op": "daily", "rows": {
+                "600519.SH": [
+                    {"date": "2026-01-05", "open": 1.0, "high": 1.0, "low": 1.0, "close": 10.0,
+                     "volume": 1, "amount": 1.0, "code": "600519"},
+                    {"date": "2026-01-06", "open": 1.0, "high": 1.0, "low": 1.0, "close": 11.0,
+                     "volume": 1, "amount": 1.0, "code": "600519"},
+                ],
+            }}
+        if job["op"] == "adj":
+            return {"ok": True, "op": "adj", "rows": {
+                "600519.SH": [
+                    {"symbol": "600519.SH", "trade_date": "2026-01-06", "ex_factor": 1.1},
+                ],
+            }}
+        return {"ok": True, "op": job["op"], "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    p = StockSDKProvider()
+    w0, w1 = dt.datetime(2026, 1, 1), dt.datetime(2026, 1, 15)
+
+    p.get_daily(["600519.SH"], w0, w1)
+    df = p.get_adj_factors(["600519.SH"], w0, w1)
+
+    # 除权阶段只走 op:adj 事件拉取, 绝不发 hfq/adjust 基线合成
+    assert [c["op"] for c in calls[1:]] == ["adj"]
+    assert df["trade_date"].to_list() == [dt.date(2026, 1, 6)]
+    assert abs(df["ex_factor"][0] - 1.1) < 1e-9
+
+
+def test_adj_factors_drop_insane_ex_factor(monkeypatch):
+    """1e26 级脏因子(实测会导致 enriched strict_cast 崩溃)必须在 provider 边界丢弃。"""
+    _patch_run_job(monkeypatch, {
+        "adj": {"ok": True, "op": "adj", "rows": {
+            "600519.SH": [
+                {"symbol": "600519.SH", "trade_date": "2020-01-02", "ex_factor": 5.29},
+                {"symbol": "600519.SH", "trade_date": "2020-01-03", "ex_factor": 1.9515e26},
+                {"symbol": "600519.SH", "trade_date": "2020-01-04", "ex_factor": 0},
+                {"symbol": "600519.SH", "trade_date": "2020-01-05", "ex_factor": None},
+                {"symbol": "600519.SH", "trade_date": "2020-01-06", "ex_factor": -1.0},
+            ],
+        }},
+    })
+    df = StockSDKProvider().get_adj_factors(["600519.SH"], None, None)
+
+    assert df.height == 1
+    assert df["trade_date"][0] == dt.date(2020, 1, 2)
+    assert abs(df["ex_factor"][0] - 5.29) < 1e-9
+
+
+def test_adj_breaks_after_consecutive_empty_chunks(monkeypatch):
+    """连续空批(限流形态)应熔断中止, 而不是空转完全部批次。"""
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        return {"ok": True, "op": job["op"], "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 20)]  # 20 批全空
+
+    with pytest.raises(sp.UpstreamThrottledError):
+        StockSDKProvider().get_adj_factors(
+            syms, dt.datetime(2026, 1, 1), dt.datetime.now(),
+        )
+
+    # 熔断后未开始的批次不再发起桥接调用 (在飞批次自然结束, 至多 _PARALLEL_BRIDGE 条)
+    assert len(calls) <= sp._EMPTY_BREAK_CHUNKS + sp._PARALLEL_BRIDGE
+
+
+def test_adj_breaker_not_armed_for_history_window(monkeypatch):
+    """历史补数据窗口不熔断: 当年未上市标的的空返回是正常形态, 不可误杀。"""
+    calls = []
+
+    def fake(job, timeout=None):
+        calls.append(job)
+        return {"ok": True, "op": job["op"], "rows": {}}
+
+    monkeypatch.setattr(sp.bridge, "run_job", fake)
+    syms = [f"{600000 + i}.SH" for i in range(sp._BATCH * 5)]
+    old_end = dt.datetime(2015, 1, 1)
+
+    df = StockSDKProvider().get_adj_factors(
+        syms, old_end - dt.timedelta(days=365), old_end,
+    )
+
+    assert df.is_empty()
+    assert len(calls) == 5  # 全部批次照常执行
