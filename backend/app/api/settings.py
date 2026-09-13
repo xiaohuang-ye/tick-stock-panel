@@ -592,6 +592,7 @@ def get_capability_matrix() -> dict:
             "realtime_data_provider": preferences.get_realtime_data_provider(),
             "daily_data_provider": preferences.get_daily_data_provider(),
             "minute_data_provider": preferences.get_minute_data_provider(),
+            "full_minute_data_provider": preferences.get_full_minute_data_provider(),
             "depth5_data_provider": preferences.get_depth5_data_provider(),
             "adj_factor_provider": preferences.get_adj_factor_provider(),
             "financial_data_provider": preferences.get_financial_provider(),
@@ -1666,7 +1667,9 @@ async def test_endpoint(req: TestEndpointIn) -> dict:
     import statistics
 
     base = req.url.rstrip("/")
-    rounds = max(1, min(10, req.rounds or _endpoints_cache.get("data", {}).get("testRounds", 5)))
+    # 缓存初值的 "data" 是 None(键存在, get 的默认值不生效), 端点清单未预热时要兜底
+    manifest = _endpoints_cache.get("data") or {}
+    rounds = max(1, min(10, req.rounds or manifest.get("testRounds", 5)))
     health_url = base + "/health"
 
     latencies: list[float] = []

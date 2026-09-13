@@ -318,11 +318,15 @@ def sync_daily_by_quotes(repo: KlineRepository) -> int:
             "close": q.get("last_price"),
             "volume": q.get("volume"),
             "amount": q.get("amount"),
+            # 快照时刻标记: data_integrity 靠 quote_ts 区分盘中快照与盘后权威历史,
+            # 缺失会让盘中覆写的分区在停机后被当成完整历史, 永远不进修复。
+            "quote_ts": q.get("timestamp"),
         })
 
     df = pl.DataFrame(records)
     if df.is_empty():
         return 0
+    df = df.with_columns(pl.col("quote_ts").cast(pl.Int64, strict=False))
 
     # 分区日期用北京交易日 (与 quote_service._build_daily 的 cn_today 一致),
     # 避免 UTC 服务器在盘中把日分区写成服务器本地日期。
@@ -740,9 +744,16 @@ def _write_minute_partition(df: pl.DataFrame, minute_dir) -> int:
             existing = pl.read_parquet(out)
             if "datetime" in existing.columns:
                 existing = existing.filter(pl.col("datetime").is_not_null())
-            day_df = pl.concat([existing, day_df.drop("_trade_date")]).unique(
+            new_rows = day_df.drop("_trade_date")
+            # 只对本次触及的 symbol 合并去重, 未触及行原样保留: 单股补齐时避免
+            # 为合并几行数据把全市场分区整体 unique 的写放大 (issue #305)。
+            touched = new_rows["symbol"].unique().to_list()
+            same = existing.filter(pl.col("symbol").is_in(touched))
+            other = existing.filter(~pl.col("symbol").is_in(touched))
+            merged = pl.concat([same, new_rows]).unique(
                 subset=["symbol", "datetime"], keep="last",
             )
+            day_df = pl.concat([other, merged])
         else:
             day_df = day_df.drop("_trade_date")
         day_df = day_df.sort("symbol", "datetime")
@@ -1309,29 +1320,38 @@ def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
     return _normalize_adj_factor(raw)
 
 
+def _as_beijing(d: datetime) -> datetime:
+    """落盘的分钟 datetime 是北京墙钟 naive, 带上北京时区再交给取数窗口。
+
+    naive 值经 _datetime_to_ms 会被 .timestamp() 按服务器本地时区解释, 与同
+    窗口另一端的服务器本地时间混用后整体错位 (UTC 容器上错 8 小时)。
+    """
+    return d if d.tzinfo is not None else d.replace(tzinfo=CN_TZ)
+
+
 def _latest_minute_datetime(repo: KlineRepository) -> datetime | None:
-    """本地分钟 K 数据的最新时间。"""
+    """本地分钟 K 数据的最新时间 (北京时区)。"""
     try:
         res = repo.execute_one("SELECT max(datetime) FROM kline_minute")
         if res and res[0]:
             d = res[0]
             if isinstance(d, datetime):
-                return d
-            return datetime.fromisoformat(str(d))
+                return _as_beijing(d)
+            return _as_beijing(datetime.fromisoformat(str(d)))
     except Exception:  # noqa: BLE001
         pass
     return None
 
 
 def _earliest_minute_datetime(repo: KlineRepository) -> datetime | None:
-    """本地分钟 K 数据的最早时间 (用于向前扩展的起点)。"""
+    """本地分钟 K 数据的最早时间 (北京时区, 用于向前扩展的起点)。"""
     try:
         res = repo.execute_one("SELECT min(datetime) FROM kline_minute")
         if res and res[0]:
             d = res[0]
             if isinstance(d, datetime):
-                return d
-            return datetime.fromisoformat(str(d))
+                return _as_beijing(d)
+            return _as_beijing(datetime.fromisoformat(str(d)))
     except Exception:  # noqa: BLE001
         pass
     return None
@@ -1453,7 +1473,9 @@ def sync_and_persist_minute(
     # 迁移:旧版按 symbol= 分区转为 date= 分区
     _migrate_symbol_to_date_partition(repo)
 
-    now = datetime.now()
+    # 窗口两端统一为北京时区: 起止点会与本地分钟 K 的北京墙钟混用, 用服务器
+    # 本地时间会让窗口整体错位 (UTC 容器上起点晚于终点, 增量补拉一个请求都发不出)。
+    now = cn_now()
 
     if extend_backward:
         # 向前扩展模式: 从本地最早数据往前补, 叠加已有数据避免缺口。
