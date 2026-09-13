@@ -381,6 +381,41 @@ def _normalize_adj_factor(raw) -> pl.DataFrame:
     return df.select(cols).drop_nulls()
 
 
+def _merge_factor_window(
+    existing: pl.DataFrame,
+    new_data: pl.DataFrame,
+    affected: list[str],
+    start_time: datetime | None,
+    end_time: datetime | None,
+) -> pl.DataFrame:
+    """合并除权因子: 受影响 symbol 在同步窗口内"先删后插"。
+
+    旧的 upsert(unique(subset=symbol,trade_date), keep=last) 从不删除窗口内
+    无新事件的行, 导致伪造的"每日快照/累计因子"行(如 stock-sdk hfq 基线合成
+    的 ex_factor=close_hfq/close_none, 2026-09 中天科技 0813 事故)永久残留,
+    污染 _apply_adj_factor 的 cum_prod, 把历史前复权价压成 ~0。
+
+    改为: 仅对 affected(=本次返回有事件行的 symbol)剔除其在 [start,end]
+    窗口内的旧行, 再并入 new_data; 窗口外历史行与未受影响 symbol 保持不动。
+    - 窗口为空(start=None 且 end=None)→ 受影响 symbol 全量替换;
+    - 提供方返回空(限流/无数据)时 affected 为空 → 现有数据原样保留,
+      避免把限流当"无事件"而误删既有因子。
+    """
+    keep = existing
+    if affected and not existing.is_empty():
+        cond = pl.col("symbol").is_in(affected)
+        if start_time is not None:
+            cond = cond & (pl.col("trade_date") >= pl.lit(start_time.date()))
+        if end_time is not None:
+            cond = cond & (pl.col("trade_date") <= pl.lit(end_time.date()))
+        keep = existing.filter(~cond)
+    if new_data.is_empty():
+        return keep
+    return pl.concat([keep, new_data]).unique(
+        subset=["symbol", "trade_date"], keep="last",
+    ).sort(["symbol", "trade_date"])
+
+
 def sync_adj_factor(symbols: list[str], repo: KlineRepository,
                     capset: CapabilitySet,
                     start_time: datetime | None = None,
@@ -415,12 +450,11 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
             out.parent.mkdir(parents=True, exist_ok=True)
             if out.exists():
                 existing = pl.read_parquet(out)
-                before = existing.height
-                merged = pl.concat([existing, new_data]).unique(
-                    subset=["symbol", "trade_date"], keep="last",
-                ).sort(["symbol", "trade_date"])
+                merged = _merge_factor_window(
+                    existing, new_data, affected, start_time, end_time,
+                )
                 _atomic_write_parquet(merged, out)
-                return merged.height - before, affected
+                return new_data.height, affected
             _atomic_write_parquet(new_data.sort(["symbol", "trade_date"]), out)
             return new_data.height, affected
         # 自定义源未配置 adj_factor → 回退 TickFlow
@@ -483,15 +517,13 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
 
     if out.exists():
         existing = pl.read_parquet(out)
-        before = existing.height
-        merged = pl.concat([existing, new_data]).unique(
-            subset=["symbol", "trade_date"], keep="last",
-        ).sort(["symbol", "trade_date"])
+        merged = _merge_factor_window(
+            existing, new_data, affected, start_time, end_time,
+        )
         _atomic_write_parquet(merged, out)
-        added = merged.height - before
         logger.info("adj_factor merged: %d total (+%d new), %d/%d symbols",
-                     merged.height, added, new_data.height, len(symbols))
-        return added, affected
+                     merged.height, new_data.height, new_data.height, len(symbols))
+        return new_data.height, affected
     else:
         _atomic_write_parquet(new_data.sort(["symbol", "trade_date"]), out)
         logger.info("adj_factor synced: %d rows (%d symbols)", new_data.height, len(symbols))

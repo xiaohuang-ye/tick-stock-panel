@@ -262,6 +262,32 @@ def _apply_adj_factor(raw: pl.DataFrame, factors: pl.DataFrame) -> pl.DataFrame:
     if factors.is_empty():
         return raw
 
+    # ── 非稀疏防御 (2026-09 中天科技 0813 数据事故) ──
+    # 除权因子契约是"单事件 pre/post 比值"的稀疏事件表; 若某 symbol 在连续交易日
+    # 密集产出因子行(如顶部写入方曾用 hfq/raw 每日合成累计比值), 会把 cum_prod
+    # 指数放大, 把历史前复权价压成 ~0。真实除权事件日期不会连续几天密集出现
+    # (同日成分已在上游合并), 这里按"相邻因子行日期间隔 ≤3 天"的连续簇长度
+    # 识别伪造序列, 直接跳过该 symbol 的复权(价保 raw 原样), 不再静默产出 0。
+    dense = (
+        factors.sort(["symbol", "trade_date"])
+        .with_columns(
+            pl.col("trade_date").diff().dt.total_days().over("symbol").alias("_gap"),
+        )
+        .filter(pl.col("_gap").is_not_null() & (pl.col("_gap") <= 3))
+        .group_by("symbol")
+        .agg(pl.len().alias("_consec"))
+        .filter(pl.col("_consec") > 3)
+    )
+    if not dense.is_empty():
+        _bad = dense["symbol"].to_list()
+        logger.warning(
+            "复权因子非稀疏(疑似每日累计/快照因子), 跳过 %d 只前复权(价保原始): 样例 %s",
+            len(_bad), _bad[:10],
+        )
+        factors = factors.filter(~pl.col("symbol").is_in(_bad))
+        if factors.is_empty():
+            return raw
+
     # 去重 + 排序 + 累积乘积 (一趟完成)
     factors_sorted = (
         factors.sort(["symbol", "trade_date"])
