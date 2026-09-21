@@ -290,7 +290,9 @@ class QuoteService:
         if self._thread:
             self._thread.join(timeout=10)
             self._thread = None
-        self._save_enabled(False)
+        # 此处不持久化关闭: lifespan shutdown (容器停止/重启) 也调用 stop,
+        # 持久化 False 会让每次重启后实时行情都变关闭、需手动再开。
+        # 持久化语义归 disable() (用户主动关闭)。
         logger.info("行情服务已停止")
 
     def enable(self) -> bool:
@@ -316,6 +318,7 @@ class QuoteService:
     def disable(self) -> None:
         """关闭自动行情。"""
         self.stop()
+        self._save_enabled(False)
         logger.info("行情服务已关闭")
 
     # ================================================================
@@ -893,10 +896,11 @@ class QuoteService:
             self._flush_live_enriched(daily_df, quote_extra, asset_type="stock")
         if not etf_daily_df.is_empty() and self._repo:
             self._flush_live_enriched(etf_daily_df, etf_quote_extra, asset_type="etf")
-        # ---- 指数: 仅有指数监控规则时才写盘 (无规则零成本) ----
-        # 指数为按码显式拉取 (部分标的) → merge 不截断分区
-        engine = getattr(self._app_state, "monitor_engine", None) if self._app_state else None
-        if engine and engine.has_asset_rules("index") and self._repo:
+        # ---- 指数: 核心四只每轮已显式拉取, 与股票/ETF 同口径 merge 写盘 ----
+        # 不能再门控 has_asset_rules("index"): 默认配置无指数监控规则, 否则
+        # 盘中 kline_index_enriched 停在上一交易日, 读侧守卫直接跳过不注入。
+        # 指数为按码显式拉取 (部分标的) → merge 不截断分区。
+        if self._repo:
             index_daily_df = self._build_daily(index_records)
             if not index_daily_df.is_empty():
                 try:
@@ -997,6 +1001,10 @@ class QuoteService:
         ] if c in df.columns]
         if not keep or "symbol" not in keep:
             return pl.DataFrame()
+        # 整列 null = 数据源未提供该字段 (如 fuyao 的 turnover_rate/amplitude 显式置 None),
+        # 必须丢弃: 下游 compute_enriched_today 对这些列是「列存在即直接采用」,
+        # 转发全空列会跳过回退计算, 当日换手/振幅将永远为空且每轮实时覆写自锁
+        keep = [c for c in keep if c == "symbol" or df[c].null_count() < len(df)]
         out = df.select(keep)
         # 实时 API 的 turnover_rate 入口契约为小数制(0.05 = 5%).
         # enriched 内部统一存百分数值(5 = 5%), 后续页面/筛选直接展示和比较。
@@ -1225,10 +1233,12 @@ class QuoteService:
                     # 独立 try —— ETF 轮任何异常都不得丢弃本轮已算出的股票告警。
                     # refresh=False —— 不在轮询线程上触发 ETF 冷缓存的同步重算 (缓存由 ETF 实时
                     # flush 焐热; 未焐热说明无 ETF 实时数据, 跳过本轮 ETF 评估)。
+                    # 日期守卫同指数轮: 自选/选股等页面会把磁盘上一交易日的 ETF 快照读进缓存,
+                    # ETF 实时拉取关闭 (默认) 或休市时它不会被当日数据替换, 不得当作当日评估。
                     if engine.has_asset_rules("etf") and self._repo is not None:
                         try:
-                            etf_enriched, _ = self._repo.get_enriched_latest_asset("etf", refresh=False)
-                            if not etf_enriched.is_empty():
+                            etf_enriched, etf_date = self._repo.get_enriched_latest_asset("etf", refresh=False)
+                            if not etf_enriched.is_empty() and etf_date == cn_today():
                                 etf_enriched = self._inject_intraday_signals(etf_enriched, engine, "etf")
                                 rule_events = rule_events + engine.evaluate(
                                     etf_enriched, asset_type="etf", reset_strategy_results=False,
@@ -1237,7 +1247,7 @@ class QuoteService:
                             logger.warning("ETF 监控评估失败 (不影响股票告警): %s", e)
                     # 指数规则轮: 复刻 ETF 轮。快照由指数实时 flush 焐热;
                     # refresh=False 冷缓存不同步重算; 显式日期守卫防陈旧 parquet 误告警
-                    # (ETF 轮靠空表隐式跳过, 指数轮更显式, 行为等价)。
+                    # (与 ETF 轮同口径)。
                     if engine.has_asset_rules("index") and self._repo is not None:
                         try:
                             index_enriched, index_date = self._repo.get_enriched_latest_asset("index", refresh=False)
@@ -1754,6 +1764,7 @@ class QuoteService:
             if not use_incremental:
                 from datetime import timedelta
                 from app.indicators.pipeline import compute_enriched
+                from app.tickflow.repository import _live_agg_window_start
 
                 logger.info("enriched 全量计算 (live_agg=%s, 上次日期=%s)",
                             "ok" if not live_agg.is_empty() else "空", prev_date)
@@ -1764,7 +1775,8 @@ class QuoteService:
                 ohlcv_cols = ["symbol", "date", "open", "high", "low", "close", "volume", "amount", "quote_ts"]
                 hist_df = guarded_collect(
                     scan_daily_parquet(daily_glob)
-                    .filter(pl.col("date") >= cutoff)
+                    # 多读一段自然日, 再按交易日计数确定窗口起点 (长假前后 90 个自然日不足 60 个交易日)
+                    .filter(pl.col("date") >= cutoff - timedelta(days=60))
                     .sort(["symbol", "date"]),
                     priority="background",
                 )
@@ -1773,6 +1785,9 @@ class QuoteService:
 
                 hist_cols = [c for c in ohlcv_cols if c in hist_df.columns]
                 hist_df = hist_df.select(hist_cols).filter(pl.col("date") != today)
+                # 与股票盘中递推窗口同口径: 至少覆盖 60 个交易日, 否则 MA60/60 日极值/60 日动量为空
+                window_start = _live_agg_window_start(hist_df["date"], today, cutoff)
+                hist_df = hist_df.filter(pl.col("date") >= window_start)
                 daily_ohlcv = daily_df.select([c for c in ohlcv_cols if c in daily_df.columns])
                 full_df = pl.concat([hist_df, daily_ohlcv], how="diagonal_relaxed")
                 full_df = full_df.sort(["symbol", "date"])
