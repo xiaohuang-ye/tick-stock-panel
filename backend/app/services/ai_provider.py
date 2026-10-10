@@ -161,6 +161,11 @@ def current_ai_context_window() -> int:
     return secrets_store.get_ai_config_int("ai_context_window", settings.ai_context_window)
 
 
+def current_ai_round_checkpoint() -> int:
+    """AI 助手工具轮次检查点 (0=不检查): secrets.json 优先, 否则 config 默认。"""
+    return secrets_store.get_ai_config_int("ai_round_checkpoint", settings.ai_round_checkpoint)
+
+
 def _resolve_max_tokens(max_tokens: int | None) -> int | None:
     """显式传入的 max_tokens 钳制到配置输出上限; None 保持 None。
 
@@ -369,17 +374,7 @@ async def generate_ai_text_with_tools(
 
         assistant = {
             "role": "assistant",
-            "tool_calls": [
-                {
-                    "id": tc.id,
-                    "type": getattr(tc, "type", "function"),
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in tool_calls
-            ],
+            "tool_calls": [_assistant_tool_call(tc) for tc in tool_calls],
         }
         if message.content:
             assistant["content"] = message.content
@@ -399,6 +394,23 @@ async def generate_ai_text_with_tools(
             )
 
     return req_messages
+
+
+def _assistant_tool_call(tc) -> dict:
+    """SDK 返回的 tool_call 转成回传用的 dict; Gemini 3 的 extra_content
+    (thought_signature) 需原样带回, 否则下一轮被上游 400 拒绝。"""
+    item = {
+        "id": tc.id,
+        "type": getattr(tc, "type", "function"),
+        "function": {
+            "name": tc.function.name,
+            "arguments": tc.function.arguments,
+        },
+    }
+    extra = getattr(tc, "extra_content", None)
+    if extra:
+        item["extra_content"] = extra
+    return item
 
 
 def _parse_tool_arguments(raw: str) -> dict:

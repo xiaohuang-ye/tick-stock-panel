@@ -28,7 +28,7 @@ import { toast } from '@/components/Toast'
 import { usePreferences } from '@/lib/useSharedQueries'
 import { useReviewState } from '@/lib/useReviewStore'
 import {
-  startReviewGeneration, resetReview, isReviewGenerating,
+  startReviewGeneration, resetReview, isReviewGenerating, cancelReviewGeneration,
   type ReviewPhase,
 } from '@/lib/reviewStore'
 
@@ -41,10 +41,6 @@ function fmtPctAlready(v: number | null | undefined, digits = 2, withSign = fals
   if (v == null || Number.isNaN(v)) return '—'
   const sign = withSign && v > 0 ? '+' : ''
   return `${sign}${v.toFixed(digits)}%`
-}
-function pctClass(v: number | null | undefined): string {
-  if (v == null || Number.isNaN(v) || v === 0) return 'text-muted'
-  return v > 0 ? 'text-bull' : 'text-bear'
 }
 // A 股惯例: 强势=红, 弱式=绿(对齐 Dashboard scoreColor)
 function scoreColor(v: number | null | undefined): string {
@@ -657,7 +653,7 @@ function MarketSummaryBar({ data }: { data: OverviewMarket }) {
   const indices = (data.indices ?? []).slice(0, 4)
 
   return (
-    <div className="flex flex-wrap items-center gap-x-5 gap-y-2 rounded-card border border-border bg-surface/80 px-4 py-2.5">
+    <div className="flex flex-nowrap items-center gap-x-5 overflow-x-auto rounded-card border border-border bg-surface/80 px-4 py-2.5 [&>*]:shrink-0">
       {/* 情绪分(带色徽章)—— 复盘的核心定调 */}
       <div className="flex items-center gap-2">
         <span
@@ -675,11 +671,11 @@ function MarketSummaryBar({ data }: { data: OverviewMarket }) {
       <div className="hidden h-7 w-px bg-border sm:block" />
 
       {/* 四大指数(简称:上深创科)*/}
-      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+      <div className="flex flex-nowrap items-center gap-x-2.5 [&>*]:shrink-0">
         {indices.map(idx => (
           <div key={idx.symbol} className="flex items-center gap-1">
             <span className="text-[11px] text-secondary">{indexShort(idx.name, idx.symbol)}</span>
-            <span className={cn('font-mono text-[11px] font-semibold tabular-nums', pctClass(idx.change_pct))}>
+            <span className={cn('font-mono text-[11px] font-semibold tabular-nums', priceColorClass(idx.change_pct))}>
               {fmtPctAlready(idx.change_pct, 2, true)}
             </span>
           </div>
@@ -756,7 +752,7 @@ function ReportPanel({
           <Sparkles className="absolute -right-1 -top-1 h-5 w-5 text-accent" />
         </div>
         <div className="text-center">
-          <div className="text-base font-semibold text-foreground">AI 大盘复盘</div>
+          <div className="text-[16px] leading-6 font-semibold text-foreground">AI 大盘复盘</div>
           <p className="mx-auto mt-2 max-w-sm text-xs leading-relaxed text-secondary">
             一键生成今日盘后复盘报告 —— 从一句话定调到明日交易计划,
             结构化输出可直接指导次日仓位与节奏。
@@ -774,7 +770,7 @@ function ReportPanel({
             { icon: '⚠️', label: '风险提示' },
           ].map((s) => (
             <div key={s.label} className="flex flex-col items-center gap-1 rounded-btn bg-elevated/40 px-2 py-2">
-              <span className="text-base">{s.icon}</span>
+              <span className="text-[16px] leading-6">{s.icon}</span>
               <span className="text-[10px] text-secondary">{s.label}</span>
             </div>
           ))}
@@ -829,6 +825,14 @@ function ReportPanel({
             </div>
             <div className="text-sm text-foreground">AI 正在复盘今日盘面…</div>
             <div className="text-xs text-secondary">分析指数结构 · 连板梯队 · 板块轮动 · 资金情绪</div>
+            <button
+              type="button"
+              onClick={cancelReviewGeneration}
+              className="mt-1 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-secondary transition-colors hover:bg-elevated hover:text-foreground"
+            >
+              <X className="h-3 w-3" />
+              取消生成
+            </button>
           </div>
         ) : (
           <div className="prose prose-invert max-w-none">
@@ -927,7 +931,7 @@ function HistoryPanel({
                             return pcts.map((p) => (
                               <span key={p.name} className="inline-flex items-center gap-0.5 text-[10px]">
                                 <span className="text-secondary">{p.name}</span>
-                                <span className={cn('font-mono font-medium tabular-nums', pctClass(p.pctNum))}>{p.pctStr}</span>
+                                <span className={cn('font-mono font-medium tabular-nums', priceColorClass(p.pctNum))}>{p.pctStr}</span>
                               </span>
                             ))
                           })()

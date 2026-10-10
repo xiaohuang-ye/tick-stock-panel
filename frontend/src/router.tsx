@@ -1,8 +1,6 @@
-import { lazy } from 'react'
+import { lazy, Suspense } from 'react'
 import { createBrowserRouter, Navigate, useSearchParams } from 'react-router-dom'
 import { Layout } from './components/Layout'
-import { Onboarding } from './pages/Onboarding'
-import { Auth } from './pages/Auth'
 import { useSettings } from './lib/useSharedQueries'
 import { Logo } from './components/Logo'
 import { ExtensionBoundary } from './extensions/ExtensionBoundary'
@@ -23,6 +21,7 @@ const Financials = lazy(() => import('./pages/Financials').then(m => ({ default:
 const Data = lazy(() => import('./pages/Data').then(m => ({ default: m.Data })))
 const Monitor = lazy(() => import('./pages/Monitor').then(m => ({ default: m.Monitor })))
 const Lots = lazy(() => import('./pages/Lots').then(m => ({ default: m.Lots })))
+const Paper = lazy(() => import('./pages/Paper').then(m => ({ default: m.Paper })))
 const Dashboard = lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })))
 const AnalysisDetail = lazy(() => import('./pages/AnalysisDetail').then(m => ({ default: m.AnalysisDetail })))
 const ConceptAnalysis = lazy(() => import('./pages/ConceptAnalysis').then(m => ({ default: m.ConceptAnalysis })))
@@ -37,6 +36,9 @@ const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.S
 const Regime = lazy(() => import('./pages/Regime').then(m => ({ default: m.Regime })))
 const AbnormalMoves = lazy(() => import('./pages/AbnormalMoves').then(m => ({ default: m.AbnormalMoves })))
 const Dev = lazy(() => import('./pages/Dev').then(m => ({ default: m.Dev })))
+// Onboarding 只在首次使用时进入, Auth 只在登录页用到 — 均改按需加载
+const Onboarding = lazy(() => import('./pages/Onboarding').then(m => ({ default: m.Onboarding })))
+const Auth = lazy(() => import('./pages/Auth').then(m => ({ default: m.Auth })))
 
 const CORE_ROUTE_PATHS = new Set([
   '/',
@@ -94,7 +96,7 @@ function OnboardingGuard({ children }: { children: React.ReactNode }) {
   // 防误重定向已由 Onboarding/AI 等处 invalidate 前的 setQueryData 同步缓存兜底。
   if (settings.isLoading) {
     return (
-      <div className="min-h-screen bg-base grid place-items-center">
+      <div className="min-h-full bg-base grid place-items-center">
         <div className="flex flex-col items-center gap-3 text-muted">
           <Logo size={28} className="text-foreground" />
           <div className="text-xs">加载中…</div>
@@ -111,9 +113,32 @@ function OnboardingGuard({ children }: { children: React.ReactNode }) {
   return <>{children}</>
 }
 
+// 按需路由的加载占位 (与 OnboardingGuard 的加载态同风格)
+function RouteFallback() {
+  return (
+    <div className="min-h-full bg-base grid place-items-center">
+      <Logo size={28} className="text-foreground" />
+    </div>
+  )
+}
+
 export const router = createBrowserRouter([
-  { path: '/onboarding', element: <Onboarding /> },
-  { path: '/login', element: <Auth /> },
+  {
+    path: '/onboarding',
+    element: (
+      <Suspense fallback={<RouteFallback />}>
+        <Onboarding />
+      </Suspense>
+    ),
+  },
+  {
+    path: '/login',
+    element: (
+      <Suspense fallback={<RouteFallback />}>
+        <Auth />
+      </Suspense>
+    ),
+  },
   {
     path: '/',
     element: (
@@ -139,6 +164,7 @@ export const router = createBrowserRouter([
       { path: 'data', element: <Data /> },
       { path: 'monitor', element: <Monitor /> },
       { path: 'lots', element: <Lots /> },
+      { path: 'paper', element: <Paper /> },
       { path: 'signals', element: <Signals /> },
       { path: 'limit-ladder', element: <LimitUpLadder /> },
       { path: 'indices', element: <Indices /> },

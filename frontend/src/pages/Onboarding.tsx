@@ -37,7 +37,7 @@ const BRAND = '#8B5CF6'
 
 const HIGHLIGHTS = [
   { icon: LineChart,   title: '看板与自选', desc: '市场全景看板、涨跌分布、情绪雷达,自定义自选列表', tint: 'text-accent' },
-  { icon: ScanSearch,  title: '策略选股',   desc: '内置多套选股策略,一键扫描全市场命中标的', tint: 'text-bull' },
+  { icon: ScanSearch,  title: '策略',   desc: '内置多套策略,一键扫描全市场命中标的', tint: 'text-bull' },
   { icon: TrendingUp,  title: '个股分析',   desc: 'AI 四维分析个股,关键价位、技术形态一目了然', tint: 'text-warning' },
   { icon: Flame,       title: '连板梯队',   desc: '涨停梯队、封板强度、炸板监控,情绪温度计', tint: 'text-warning' },
   { icon: Landmark,    title: '概念行业',   desc: '概念板块、行业维度的资金流向与热度排名', tint: 'text-accent' },
@@ -74,7 +74,7 @@ export function Onboarding() {
   const finish = () => complete.mutate()
 
   return (
-    <div className="relative min-h-screen bg-base overflow-hidden flex flex-col">
+    <div className="relative min-h-full bg-base overflow-hidden flex flex-col">
       {/* 背景光晕 —— 品牌 + 主色渐变 */}
       <div className="pointer-events-none absolute inset-0 overflow-hidden">
         <div
@@ -227,7 +227,7 @@ function WelcomeStep({ onNext, onSkip }: { onNext: () => void; onSkip: () => voi
         欢迎使用 TSP
       </h1>
       <p className="mt-3 text-sm text-secondary leading-relaxed max-w-md mx-auto">
-        一个本地化的 A 股量化分析面板 —— 行情、选股、回测、监控、财务一体化。
+        一个本地化的 A 股量化分析面板 —— 行情、策略、回测、监控、财务一体化。
         花一分钟配置,即可开始使用。
       </p>
 
@@ -650,6 +650,19 @@ function ResultStep({ onNext, onBack }: { onNext: () => void; onBack: () => void
           <Loader2 className="h-3.5 w-3.5 animate-spin" />
           正在检测能力路由…
         </div>
+      ) : matrix.isError ? (
+        <div className="mt-5 flex flex-col items-center gap-2 rounded-card border border-danger/30 bg-danger/[0.04] p-5 text-center">
+          <span className="text-xs text-secondary">能力路由检测失败，请重试</span>
+          <button
+            type="button"
+            onClick={() => matrix.refetch()}
+            disabled={matrix.isFetching}
+            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1 text-xs text-accent transition-colors hover:bg-elevated disabled:opacity-50"
+          >
+            <Loader2 className={matrix.isFetching ? 'h-3 w-3 animate-spin' : 'h-3 w-3'} />
+            重试
+          </button>
+        </div>
       ) : routes.length === 0 ? (
         <div className="mt-5 rounded-card border border-border bg-surface/80 p-5 text-center text-xs text-muted">
           暂未获取到能力路由矩阵,可稍后在 设置 → 数据源 中重新检测。
@@ -740,7 +753,7 @@ function FinishStep({ onNext, onBack, pending }: { onNext: () => void; onBack: (
   // 快速上手入口(精简为核心功能)
   const tips = [
     { icon: TrendingUp, text: '「个股分析」:输入代码,AI 四维分析 + 关键价位' },
-    { icon: ScanSearch, text: '「选股」页:内置多套策略,一键扫描全市场' },
+    { icon: ScanSearch, text: '「策略」页:内置多套策略,一键扫描全市场' },
     { icon: ShieldCheck, text: '「回测」页:用历史数据验证策略表现,用数据说话' },
   ]
 

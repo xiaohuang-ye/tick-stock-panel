@@ -606,6 +606,7 @@ class KlineRepository:
             # 300 日历天 ≈ 210 交易日, 覆盖 filter_history 最大 lookback(90) + warmup(60)
             try:
                 from datetime import timedelta
+
                 from app.indicators.pipeline import compute_enriched_history_window
                 start_full = latest - timedelta(days=300)
                 read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
@@ -763,6 +764,7 @@ class KlineRepository:
         优化: 优先使用 _enriched_history_cache (启动时已计算), 避免重复 compute_indicators。
         """
         from datetime import timedelta
+
         from app.indicators.pipeline import _ema_alpha
 
         started = time.perf_counter()
@@ -1051,6 +1053,7 @@ class KlineRepository:
                 return
 
             from datetime import timedelta
+
             from app.indicators.pipeline import compute_indicators, compute_signals
             start_full = latest - timedelta(days=300)
             read_cols = [c for c in ["symbol", "date", "open", "high", "low", "close",
@@ -1223,7 +1226,7 @@ class KlineRepository:
         # 按交易日计数裁剪: 从数据里实际存在的交易日序列取最后 lookback_days 个交易日。
         # 不能用 timedelta(days=N) (自然日), 否则周末/节假日会让窗口只有 ~N×5/7 个交易日,
         # 导致 filter_history 策略的滚动窗口/行号差(_gap)漏算, 与回测结果不一致。
-        # 只数目标日及之前的交易日: 历史日期选股时缓存里还有更晚的交易日
+        # 只数目标日及之前的交易日: 历史日期运行策略时缓存里还有更晚的交易日
         trading_dates = cache["date"].filter(cache["date"] <= target_date).unique().sort()
         if len(trading_dates) > lookback_days:
             lookback_start = trading_dates[-(lookback_days + 1)]
@@ -1528,6 +1531,35 @@ class KlineRepository:
             if start >= cache_date:
                 return self._filter_cached_batch(cached, symbols, columns)
 
+        # 复用 300 天预计算 enriched 历史缓存 (与单股 get_daily 同源同判据):
+        # 自选迷你蜡烛窗口 (days≤60) 完全落在缓存内, 免整树 glob 扫描;
+        # 覆盖不足 (窗口早于缓存起点 / symbol 不在缓存) 时回退扫描路径。
+        df = pl.DataFrame()
+        hist = self._enriched_history_cache
+        if hist is not None and not hist.is_empty() and "date" in hist.columns:
+            hist_min = self._enriched_history_start
+            hist_max = hist["date"].max()
+            if hist_min is not None and hist_min <= start and hist_max >= start:
+                df = hist.filter(
+                    pl.col("symbol").is_in(symbols)
+                    & (pl.col("date") >= start)
+                    & (pl.col("date") <= end)
+                )
+
+        if not df.is_empty():
+            # 用实时缓存覆盖最新日 (与单股 get_daily 的覆盖逻辑同口径)
+            if cached is not None and not cached.is_empty() and cache_date and start <= cache_date <= end:
+                cached_part = self._filter_cached_batch(cached, symbols, None)
+                if not cached_part.is_empty():
+                    df = df.filter(pl.col("date") != cache_date)
+                    common_cols = [c for c in df.columns if c in cached_part.columns]
+                    df = pl.concat([df.select(common_cols), cached_part.select(common_cols)])
+            if columns and not df.is_empty():
+                existing = [c for c in columns if c in df.columns]
+                df = df.select(existing)
+            if not df.is_empty():
+                return df.sort(["symbol", "date"])
+
         # 回退 scan_parquet
         return self._scan_daily_batch(symbols, start, end, columns)
 
@@ -1623,16 +1655,28 @@ class KlineRepository:
             logger.warning("分钟复权投影失败, 按原始数据返回: %s", e)
             return df
 
+    def _minute_partition_path(self, asset_type: str, trade_date: date) -> str | None:
+        """单日分钟K分区文件路径; 不存在 (含存量未迁移的旧 symbol= 分区) 返回 None。"""
+        base = self._minute_glob_for(asset_type).rsplit("/", 2)[0]
+        p = f"{base}/date={trade_date.isoformat()}/part.parquet"
+        return p if Path(p).exists() else None
+
     def get_minute(
         self,
         symbol: str,
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """分钟K查询 — Polars scan_parquet + predicate pushdown。"""
+        """分钟K查询 — 优先直读当日分区文件 (免全树 footer IO), 分区缺失回退全树扫描。
+
+        该查询在自选分时热路径上被每 tick、每客户端调用, 全树 glob 扫描成本随
+        本地分钟历史线性增长; 单日数据按约定完整落在 date= 分区内, 谓词不变。
+        """
         try:
+            part = self._minute_partition_path(asset_type, trade_date)
+            source = part if part is not None else self._minute_glob_for(asset_type)
             df = guarded_collect(
-                pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
+                pl.scan_parquet(source).filter(
                     (pl.col("symbol") == symbol)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort("datetime")
@@ -1648,16 +1692,18 @@ class KlineRepository:
         trade_date: date,
         asset_type: str = "stock",
     ) -> pl.DataFrame:
-        """批量分钟K查询 — 多 symbol 一次 scan_parquet。
+        """批量分钟K查询 — 多 symbol 一次 scan, 优先直读当日分区文件。
 
         用于自选列表分时图: 一次 predicate pushdown 读多只股票当日分钟K,
-        避免逐只查询的 N 次 I/O。
+        避免逐只查询的 N 次 I/O; 单日直读避免全树扫描 (同 get_minute)。
         """
         if not symbols:
             return pl.DataFrame()
         try:
+            part = self._minute_partition_path(asset_type, trade_date)
+            source = part if part is not None else self._minute_glob_for(asset_type)
             df = guarded_collect(
-                pl.scan_parquet(self._minute_glob_for(asset_type)).filter(
+                pl.scan_parquet(source).filter(
                     pl.col("symbol").is_in(symbols)
                     & (pl.col("datetime").dt.date() == trade_date)
                 ).sort(["symbol", "datetime"])
@@ -1748,7 +1794,12 @@ class KlineRepository:
 
     def _compute_enriched_range(self, df: pl.DataFrame) -> pl.DataFrame:
         """对14列enriched数据即时计算完整指标+信号。输入应含足够预热行数。"""
-        from app.indicators.pipeline import compute_indicators, compute_signals, compute_limit_signals, filter_halt_days
+        from app.indicators.pipeline import (
+            compute_indicators,
+            compute_limit_signals,
+            compute_signals,
+            filter_halt_days,
+        )
         if df.is_empty() or df.height < 2:
             return df
         # 兜底过滤历史脏数据中的停牌日 (close 可能被填充为前收盘价)
@@ -1958,7 +2009,7 @@ class KlineRepository:
         """枚举 [start, end] 内存在的分钟K分区日 (目录名直读, 零 parquet 扫描)。
 
         分钟回测按交易日精确对日: 缺分区的日子由调用方显式跳过,
-        不做"回退最近分区" (那是实盘选股的语义, 回放会串日)。
+        不做"回退最近分区" (那是实盘策略的语义, 回放会串日)。
         """
         dirname = "kline_minute" if asset_type == "stock" else f"kline_{asset_type}_minute"
         minute_dir = self.store.data_dir / dirname

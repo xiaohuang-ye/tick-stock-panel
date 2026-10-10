@@ -5,18 +5,23 @@ null); 历史交易日的 quote_ts 时刻 < 15:00 即盘中快照 → 坏。
 """
 from __future__ import annotations
 
+import time
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
+import app.data_providers
 from app.market_time import CN_TZ, cn_today
+from app.services import data_integrity as di
 from app.services.data_integrity import (
     AUTO_REPAIR_MAX_LAG_DAYS,
     IntegrityIssue,
+    _candidate_days,
     _is_snapshot,
     _quote_ts_max_ms,
+    _trading_calendar,
     earliest_issue_day,
     prune_enriched_partitions,
     scan_recent_integrity,
@@ -55,9 +60,11 @@ def _write_daily_partition(root, table: str, day: date, quote_ts: int | None, sy
 
 def test_snapshot_predicate():
     noon = _ts_ms(FRIDAY, time(11, 58))
-    after_close = _ts_ms(FRIDAY, time(15, 0, 30))
+    close_final = _ts_ms(FRIDAY, time(15, 0, 30))   # 15:00-15:30 的实时定版也不可信
+    after_cutoff = _ts_ms(FRIDAY, time(15, 30, 30))  # 过盘后固定价终止线才算收盘后写入
     assert _is_snapshot(FRIDAY, noon) is True
-    assert _is_snapshot(FRIDAY, after_close) is False
+    assert _is_snapshot(FRIDAY, close_final) is True
+    assert _is_snapshot(FRIDAY, after_cutoff) is False
     assert _is_snapshot(FRIDAY, None) is False  # batch 历史 → 权威
 
 
@@ -101,9 +108,15 @@ def test_midday_snapshot_partition_is_flagged(tmp_path):
     ]
 
 
-def test_final_snapshot_after_close_is_clean(tmp_path):
+def test_close_final_snapshot_is_flagged(tmp_path):
+    """15:00 后的 close_final 定版也是实时写入 → 判坏 (完整以盘后管道 batch 覆盖为准)。"""
     _write_daily_partition(tmp_path, "kline_daily", FRIDAY, _ts_ms(FRIDAY, time(15, 1)))
     _write_daily_partition(tmp_path, "kline_daily", TODAY, _ts_ms(TODAY, time(10, 0)))
+    issues = scan_recent_integrity(tmp_path, today=TODAY)
+    assert issues and issues[0].kind == "snapshot"
+
+    # 过 15:30 定版线 (盘后固定价终止) 的极晚写入 → 完整
+    _write_daily_partition(tmp_path, "kline_daily", FRIDAY, _ts_ms(FRIDAY, time(15, 31)))  # 覆写同分区
     assert scan_recent_integrity(tmp_path, today=TODAY) == []
 
 
@@ -341,8 +354,8 @@ def test_branch4_start_without_stale_day_uses_latest():
 
 
 def test_timezone_conversion_is_cn():
-    # quote_ts 是毫秒 Unix 时间戳, 必须按 UTC+8 折算 — 15:00 边界用例
-    ts = int(datetime(2026, 8, 21, 7, 0, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 15:00
+    # quote_ts 是毫秒 Unix 时间戳, 必须按 UTC+8 折算 — 15:30 边界用例
+    ts = int(datetime(2026, 8, 21, 7, 30, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 15:30
     assert _is_snapshot(FRIDAY, ts) is False
     ts_morning = int(datetime(2026, 8, 21, 3, 58, tzinfo=timezone.utc).timestamp() * 1000)  # 北京 11:58
     assert _is_snapshot(FRIDAY, ts_morning) is True
@@ -420,9 +433,7 @@ def test_realtime_gate_blocks_on_snapshot_and_launches_repair(tmp_path, monkeypa
     from app.services import data_integrity
 
     real_today = datetime.now(CN_TZ).date()
-    snapshot_day = real_today - timedelta(days=1)
-    while snapshot_day.weekday() >= 5:
-        snapshot_day -= timedelta(days=1)
+    snapshot_day = _recent_trading_day_before(real_today)
     _write_daily_partition(
         tmp_path, "kline_daily", snapshot_day,
         _ts_ms(snapshot_day, time(11, 58)),
@@ -485,9 +496,7 @@ def test_realtime_gate_allows_clean_data(tmp_path, monkeypatch):
     from app.api import settings as settings_api
 
     real_today = datetime.now(CN_TZ).date()
-    previous_day = real_today - timedelta(days=1)
-    while previous_day.weekday() >= 5:
-        previous_day -= timedelta(days=1)
+    previous_day = _recent_trading_day_before(real_today)
     _write_daily_partition(tmp_path, "kline_daily", previous_day, None)
     _write_daily_partition(
         tmp_path, "kline_daily", real_today,
@@ -546,9 +555,7 @@ def test_boot_check_launches_repair_within_window(tmp_path, monkeypatch):
     )
 
     real_today = datetime.now(CN_TZ).date()
-    probe = real_today - timedelta(days=1)
-    while probe.weekday() >= 5:
-        probe -= timedelta(days=1)
+    probe = _recent_trading_day_before(real_today)
     data_dir = tmp_path / "boot"
     _write_daily_partition(data_dir, "kline_daily", probe, _ts_ms(probe, time(11, 58)))
     _write_daily_partition(data_dir, "kline_daily", real_today, _ts_ms(real_today, time(10, 0)))
@@ -585,9 +592,7 @@ def test_pipeline_self_heals_snapshot_day(tmp_path, monkeypatch):
     from app.tickflow.repository import DataStore, KlineRepository
 
     today = datetime.now(CN_TZ).date()
-    yesterday = today - timedelta(days=1)
-    while yesterday.weekday() >= 5:
-        yesterday -= timedelta(days=1)
+    yesterday = _recent_trading_day_before(today)
 
     _write_full_partition(tmp_path, "kline_daily", yesterday, _ts_ms(yesterday, time(11, 58)))
     _write_full_partition(tmp_path, "kline_daily", today, _ts_ms(today, time(10, 0)))
@@ -661,3 +666,97 @@ def test_quotes_flush_partition_keeps_quote_ts_for_integrity_scan(tmp_path, monk
 
     part_dir = tmp_path / "kline_daily" / f"date={FRIDAY.isoformat()}"
     assert _quote_ts_max_ms(part_dir) == snapshot_ms
+
+
+# ── 交易日历: 候选日真实化 (2026 中秋 09-25 休市误报 missing → gate 409) ──
+#
+# issue #442: _candidate_days 用「周一~周五」近似交易日, 中秋休市日 09-25(周五)
+# 被当缺失日, realtime_gate 循环 409 (修复任务对休市日永远拉不到数据)。
+
+_CAL_FAKE_2026_09 = {
+    date(2026, 9, 21), date(2026, 9, 22), date(2026, 9, 23), date(2026, 9, 24),
+    date(2026, 9, 28),
+}  # 2026-09-25(五)~09-27(日) 中秋休市, 09-28(一) 开市
+
+
+@pytest.fixture(autouse=True)
+def _no_trading_calendar_by_default():
+    """默认把模块级日历缓存置为「过期」: 既有用例维持周几近似语义 (CI 无
+    fuyao → 探测即回退, 零外部依赖); 日历相关用例自行写入 fake 日历。
+    (fetched_at=0.0 表示 TTL 已过, 不用 time.monotonic — 本文件顶部
+    `from datetime import time` 会遮蔽标准库 time。)"""
+    saved = di._CAL
+    di._CAL = (0.0, None)
+    yield
+    di._CAL = saved
+
+
+def _patch_fuyao_calendar(monkeypatch, days):
+    fake = SimpleNamespace(
+        is_custom_provider=lambda name: True,
+        get_provider=lambda name: SimpleNamespace(trading_days=lambda: set(days)),
+    )
+    monkeypatch.setattr(app.data_providers, "custom", fake)
+    di._CAL = (0.0, None)  # 清缓存, 强制本用例走自己的日历
+
+
+def _recent_trading_day_before(day: date) -> date:
+    """严格早于 day 的最近交易日: 日历可用按日历, 否则周几近似。
+
+    取代旧的 `while d.weekday() >= 5` 探针 —— 节假日(如 2026 中秋 09-25)
+    后该探针会命中休市日, 而休市日在日历语义下不再是候选日。
+    """
+    cal = _trading_calendar()
+    d = day - timedelta(days=1)
+    while True:
+        if cal is not None:
+            if d in cal:
+                return d
+        elif d.weekday() < 5:
+            return d
+        d -= timedelta(days=1)
+
+
+def test_candidate_days_excludes_market_holiday(monkeypatch):
+    """中秋休市日不得进候选日; 真实交易日保留; 今天被严格排除。"""
+    _patch_fuyao_calendar(monkeypatch, _CAL_FAKE_2026_09)
+    got = _candidate_days(date(2026, 9, 28), 7)
+    assert date(2026, 9, 25) not in got
+    assert date(2026, 9, 24) in got
+    assert date(2026, 9, 28) not in got
+
+
+def test_candidate_days_falls_back_to_weekday_without_calendar(monkeypatch):
+    """未配置 fuyao apikey → 直接降级周几近似 (近似会把节假日误报为缺失日)。"""
+    fake = SimpleNamespace(is_custom_provider=lambda name: False)
+    monkeypatch.setattr(app.data_providers, "custom", fake)
+    got = _candidate_days(date(2026, 9, 28), 7)
+    assert got == [
+        date(2026, 9, 21), date(2026, 9, 22), date(2026, 9, 23),
+        date(2026, 9, 24), date(2026, 9, 25),
+    ]
+
+
+def test_calendar_fetch_failure_serves_last_known(monkeypatch):
+    """fuyao 抖动时沿用上次成功结果 (stale-while-error), 不退回周几近似。"""
+    _patch_fuyao_calendar(monkeypatch, _CAL_FAKE_2026_09)
+    assert _trading_calendar() == _CAL_FAKE_2026_09
+
+    def _boom():
+        raise RuntimeError("fuyao down")
+
+    fake = SimpleNamespace(
+        is_custom_provider=lambda name: True,
+        get_provider=lambda name: SimpleNamespace(trading_days=_boom),
+    )
+    monkeypatch.setattr(app.data_providers, "custom", fake)
+    di._CAL = (0.0, _CAL_FAKE_2026_09)  # fetched_at=0 → TTL 过期 → 重新探测失败
+    assert _trading_calendar() == _CAL_FAKE_2026_09
+
+
+def test_scan_no_false_missing_when_etf_lags_over_holiday(tmp_path, monkeypatch):
+    """端到端: ETF 表停在休市前最后一个交易日 + 日历可用 → 扫描不误报 missing。"""
+    _patch_fuyao_calendar(monkeypatch, _CAL_FAKE_2026_09)
+    for day in (date(2026, 9, 22), date(2026, 9, 23), date(2026, 9, 24)):
+        _write_daily_partition(tmp_path, "kline_etf_daily", day, None)
+    assert scan_recent_integrity(tmp_path, today=date(2026, 9, 28)) == []

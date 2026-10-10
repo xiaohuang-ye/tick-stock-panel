@@ -74,13 +74,13 @@ export function Financials() {
             <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-full bg-warning/10">
               <Lock className="h-6 w-6 text-warning" />
             </div>
-            <h3 className="mt-4 text-base font-semibold text-foreground">财务数据不可用</h3>
+            <h3 className="mt-4 text-[16px] leading-6 font-semibold text-foreground">财务数据不可用</h3>
             <p className="mt-2 text-xs leading-relaxed text-secondary">
               当前数据源未提供财务数据。配置提供财务数据的数据源后,此页自动显示财务数据面板。
             </p>
             <Link
               to="/settings?tab=data-sources"
-              className="mt-4 inline-flex items-center gap-1.5 rounded-btn bg-accent/90 px-3.5 py-1.5 text-xs font-medium text-base hover:bg-accent transition-colors"
+              className="mt-4 inline-flex items-center gap-1.5 rounded-btn bg-accent/90 px-3.5 py-1.5 text-xs font-medium text-white hover:bg-accent transition-colors"
             >
               前往数据源配置
             </Link>
@@ -293,7 +293,7 @@ export function Financials() {
             {/* 个股搜索区 */}
             <div>
               {selected ? (
-                // 已选股:紧凑搜索条 + 清除按钮(便于换股)
+                // 已选个股:紧凑搜索条 + 清除按钮(便于换股)
                 <div className="flex items-center gap-3">
                   <div className="flex-1 max-w-xl">
                     <StockFinancialSearch onSelect={pick} />
@@ -308,7 +308,7 @@ export function Financials() {
                   </button>
                 </div>
               ) : (
-                // 未选股:醒目居中引导
+                // 未选个股:醒目居中引导
                 <div className="flex flex-col items-center gap-3 py-8">
                   <div className="flex items-center gap-2 text-sm text-secondary">
                     <Search className="h-4 w-4 text-accent" />

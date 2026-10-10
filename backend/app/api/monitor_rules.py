@@ -21,11 +21,11 @@ def _data_dir(request: Request) -> Path:
 
 
 def _reconcile_index_asset_type(rule: dict, repo) -> dict:
-    """纠正误存为 stock 的指数规则 (asset_type → index)。
+    """纠正误存为 stock 的指数/ETF 规则 (asset_type → index/etf)。
 
-    个股弹窗加监控 / 点位提醒等入口未传 asset_type, 指数 symbol 的规则被存成
-    stock, 导致监控中心显示「个股」、引擎在股票轮评估 (指数 symbol 永不命中)。
-    仅当规则全部 symbols 都 resolve 为指数时纠正 (股票+指数混合池不动)。
+    个股弹窗加监控 / 点位提醒等入口未传 asset_type, 指数/ETF symbol 的规则被存成
+    stock, 导致监控中心显示「个股」、引擎在股票轮评估 (指数/ETF symbol 永不命中)。
+    仅当规则全部 symbols 都 resolve 为同一非 stock 类型时纠正 (混合池不动)。
     """
     if rule.get("asset_type", "stock") != "stock" or rule.get("scope") != "symbols":
         return rule
@@ -33,10 +33,13 @@ def _reconcile_index_asset_type(rule: dict, repo) -> dict:
     if not symbols:
         return rule
     try:
-        if all(repo.resolve_asset_type(s) == "index" for s in symbols):
-            rule["asset_type"] = "index"
-    except Exception:  # noqa: BLE001
-        pass
+        types = {repo.resolve_asset_type(s) for s in symbols}
+    except Exception:
+        return rule
+    if len(types) == 1:
+        only = next(iter(types))
+        if only in ("index", "etf"):
+            rule["asset_type"] = only
     return rule
 
 
@@ -123,30 +126,36 @@ def get_options(request: Request):
     """返回可选字段、信号列、运算符、枚举,供前端表单使用。"""
     from app.indicators.pipeline import ENRICHED_COLUMNS
     from app.services.kline_sync import intraday_monitor_support
-    from app.strategy.custom_signals import ALLOWED_FIELDS, load_all as load_csg
+    from app.strategy.custom_signals import (
+        ALLOWED_FIELDS,
+        intraday_column_name,
+        resolve_column,
+    )
+    from app.strategy.custom_signals import (
+        load_all as load_csg,
+    )
 
     # 阈值字段 (带中文标签)
     threshold_fields = [
         {"key": f, "label": ENRICHED_COLUMNS.get(f, f)}
         for f in sorted(ALLOWED_FIELDS)
     ]
-    # 内置信号列 (布尔, 用于 op=truth)
+    # 盘中信号列 (布尔, 用于 op=truth); 日线信号列已全部定义驱动 → custom_signals
     builtin_signals = [
-        {"key": k, "label": v}
-        for k, v in ENRICHED_COLUMNS.items()
-        if k.startswith("signal_")
-    ]
-    builtin_signals.extend(
         {"key": key, "label": label}
         for key, label in INTRADAY_SIGNAL_LABELS.items()
-    )
-    # 自定义信号列 (csg_)
+    ]
+    # 自定义信号列 (csg_ 及携带显式 signal_* 列名的迁移定义)
     custom_sigs = []
     try:
         for cs in load_csg(_data_dir(request)):
             if cs.get("enabled") is not False:
                 custom_sigs.append({
-                    "key": f"csg_{cs['id']}",
+                    "key": (
+                        intraday_column_name(cs["id"])
+                        if cs.get("timeframe") == "intraday"
+                        else resolve_column(cs)
+                    ),
                     "label": cs.get("name", cs["id"]),
                 })
     except Exception:
@@ -566,6 +575,7 @@ def trigger_ladder(request: Request):
     让用户看到真实的预警通知。绕过 cooldown 强制触发。
     """
     import time
+
     from app.services import alert_store
 
     repo = request.app.state.repo

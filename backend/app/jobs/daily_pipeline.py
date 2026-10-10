@@ -178,7 +178,7 @@ def run_instruments_sync(repo: KlineRepository) -> dict:
     """盘前同步个股维表。
 
     维表含当日涨跌停价 (limit_up/down), 同步完成后刷新 enriched 内存缓存,
-    确保跨天后连板梯队/选股等读到的是基于最新维表的数据 (而非前一交易日残留)。
+    确保跨天后连板梯队/策略等读到的是基于最新维表的数据 (而非前一交易日残留)。
     """
     rows = instrument_sync.sync_instruments(repo.store.data_dir)
     _refresh_instruments_view(repo)
@@ -227,7 +227,9 @@ def run_now(
     #   付费档 + 今天有数据 → 实时行情接口拉一次覆写（1请求全市场）
     #   有历史数据 → batch K-line API 补齐缺口
     #   无任何数据 → batch K-line API 拉首次 1 年
-    from datetime import date as _date, timedelta as _td, datetime as _dt
+    from datetime import date as _date
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
     latest_daily = repo.latest_daily_date()
     # 管道「今天」必须是北京日期: 美西主机 15:35 北京时间仍是本地昨天,
     # date.today() 会把昨日日K当成已齐, 当日官方收盘价永远拉不进来。
@@ -523,7 +525,7 @@ def run_now(
     _invalidate("enriched")
 
     # Step 2.1: 数据充足性可见化 (#303) — 空库首跑/仅当日实时覆写 1 天的库,
-    # 均线/动量/量比等指标暖机不足, 管道各 stage 都"成功"但选股会静默全 0。
+    # 均线/动量/量比等指标暖机不足, 管道各 stage 都"成功"但策略会静默全 0。
     enriched_total_days = warn_if_enriched_too_thin(repo.store.data_dir)
 
     # Step 2.3: 指数 / ETF 同步 — 物理分开存储；ETF 可复权，指数不复权。
@@ -593,17 +595,9 @@ def run_now(
                         from datetime import datetime, timedelta
                         adj_end = datetime.now()
                         adj_path = repo.store.data_dir / "adj_factor_etf" / "all.parquet"
-                        fallback_start = adj_end - timedelta(days=30)
-                        adj_start = fallback_start
-                        if adj_path.exists():
-                            max_date = pl.scan_parquet(adj_path).select(pl.col("trade_date").max()).collect().item()
-                            if max_date is not None:
-                                if isinstance(max_date, str):
-                                    adj_start = datetime.combine(_date.fromisoformat(max_date), datetime.min.time())
-                                elif isinstance(max_date, datetime):
-                                    adj_start = datetime.combine(max_date.date(), datetime.min.time())
-                                else:
-                                    adj_start = datetime.combine(max_date, datetime.min.time())
+                        # 首次无文件时与 ETF 日K 默认一年窗口对齐, 不要只拉 30 天。
+                        history_start = adj_end - timedelta(days=365)
+                        adj_start = index_sync.etf_adj_factor_window_start(adj_path, history_start)
                         _, affected_etfs = index_sync.sync_etf_adj_factor(
                             etf_symbols,
                             repo,
@@ -698,8 +692,8 @@ def run_now(
     else:
         try:
             emit("compute_regime", 90, "计算市场环境…")
-            from app.services import regime_builder
             from app.api.regime import invalidate_regime_cache
+            from app.services import regime_builder
             new_regime = regime_builder.compute_regime_incremental(repo, repo.store.data_dir)
             regime_days = new_regime.height if not new_regime.is_empty() else 0
             if regime_days:
@@ -740,6 +734,45 @@ def run_now(
             stage_errors.append(f"compute_mainline: {e}")
             skipped.append("mainline")
 
+    # Step 2.8: 模拟盘结算: 顺延单按当日开盘/收盘撮合 → 除权调整 → 定版净值。
+    # 幂等: 重跑同日不会重复成交/二次除权 (订单状态与 corp_action 台账守卫)。
+    # 必须在日K/除权同步之后, 才能读到当日 raw OHLC 与因子。核心账务不受
+    # 「市场环境」等可选开关控制, 恒运行 (开销可忽略); 软失败不阻断主管道。
+    paper_summary: dict = {}
+    try:
+        emit("paper_settle", 94, "模拟盘结算…")
+        from app.strategy import paper as paper_trading
+        # 逐账户结算 (账户间订单/台账隔离), 汇总合并供日志与结果展示
+        totals = {"filled": 0, "expired": 0, "corp_actions": 0, "nav": None, "accounts": []}
+        for acc_id in paper_trading.list_account_ids(repo.store.data_dir):
+            s = paper_trading.settle_day(repo.store.data_dir, today.isoformat(), account_id=acc_id)
+            totals["filled"] += s.get("filled", 0)
+            totals["expired"] += s.get("expired", 0)
+            totals["corp_actions"] += s.get("corp_actions", 0)
+            if s.get("nav") is not None:
+                totals["nav"] = s["nav"]
+            totals["accounts"].append({"account": acc_id, **{k: s.get(k) for k in ("filled", "expired", "corp_actions")}})
+        paper_summary = totals
+        if paper_summary.get("filled") or paper_summary.get("corp_actions"):
+            logger.info("paper_settle: %s", paper_summary)
+        # 结算成交留痕 (V3): next_open/close 单的成交发生在盘后管道内, 盘中钩子
+        # 覆盖不到; 管道无 SSE 广播器, 这里补 alert_store 留痕进监控中心即可见。
+        if totals["filled"]:
+            try:
+                from app.services import alert_store
+                settle_events = []
+                for acc_id in paper_trading.list_account_ids(repo.store.data_dir):
+                    settle_events.extend(paper_trading.day_fill_events(
+                        repo.store.data_dir, today.isoformat(), account_id=acc_id))
+                if settle_events:
+                    alert_store.append_many(repo.store.data_dir, settle_events)
+            except Exception as e:
+                logger.warning("模拟盘结算成交留痕失败: %s", e)
+        emit("paper_settle", 94, "模拟盘结算完成")
+    except Exception as e:
+        logger.warning("paper_settle failed (soft): %s", e)
+        stage_errors.append(f"paper_settle: {e}")
+
     # Step 3: 刷新视图
     emit("refresh_views", 95, "刷新 DuckDB 视图…")
     _refresh_views(repo)
@@ -760,6 +793,7 @@ def run_now(
         "minute_rows": written_minute,
         "regime_days": regime_days,
         "mainline_rows": mainline_rows,
+        "paper_settle": paper_summary,
         "lagging_symbols": len(lagging_symbols),
         "enriched_total_days": enriched_total_days,
         "integrity_repair_from": repair_start.isoformat() if repair_start else None,
@@ -865,6 +899,94 @@ def run_symbols_sync(
     }
 
 
+def run_adj_factor_sync(
+    repo: KlineRepository,
+    capset: CapabilitySet,
+    on_progress: ProgressCb | None = None,
+) -> dict:
+    """独立同步除权因子(数据页单独按钮)。
+
+    与盘后管道 Step 1.5 的差异: 管道只拉日K范围或 15 天兜底窗口;
+    这里 start_time=None 拉**全历史** —— 用于切换数据源后的因子修复、
+    以及事件明细列扩表后的存量回填 (明细回填不改变 ex_factor,
+    sync_adj_factor 的变化判定不会因此触发 enriched 重算)。
+
+    下游联动与管道同语义: adj_factor 视图刷新 → 受影响个股 enriched
+    局部重算(全部日期) → kline_enriched 视图刷新 → 两表缓存失效。
+    enriched 尚未构建时跳过重算 (全量计算是盘后管道的职责)。
+    """
+    from datetime import datetime
+
+    emit = on_progress or _noop
+    adj_provider = _prefs.get_adj_factor_provider()
+    if not (capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow"):
+        return {
+            "adj_factor_symbols": 0,
+            "adj_written": 0,
+            "enriched_days": 0,
+            "skipped_stages": ["sync_adj"],
+            "reason": "无可用除权因子数据源",
+        }
+
+    emit("resolve_universe", 5, "解析标的池…")
+    universe = _resolve_universe(capset, repo)
+    emit("resolve_universe", 10, f"标的池规模:{len(universe)} 只")
+
+    def _adj_chunk_progress(cur: int, tot: int) -> None:
+        emit("sync_adj", 10 + int(55 * cur / tot),
+             f"除权因子批次 {cur}/{tot}", stage_pct=int(100 * cur / tot), skip_log=True)
+
+    # 按需窗口: 钳到本地日K起点。前复权里早于任一根已存K线的事件在
+    # cum/total 两侧同时出现、恰好抵消, 对所有已存价格零影响 (见
+    # indicators.pipeline._apply_adj_factor) — 拉它们只会为远古事件
+    # 逐只回补历史K线, 全市场一次曾多花 ~15 分钟。
+    store_min = repo.earliest_daily_date()
+    start = datetime(store_min.year, store_min.month, store_min.day) if store_min else None
+    window_label = f"自 {store_min.isoformat()}" if store_min else "全历史"
+    logger.info(
+        "standalone adj sync: %d symbols, event window %s",
+        len(universe), window_label,
+    )
+    emit("sync_adj", 10, f"获取除权因子 [{window_label}, {len(universe)} 只]…")
+    written_adj, affected = kline_sync.sync_adj_factor(
+        universe, repo, capset,
+        start_time=start, end_time=datetime.now(),
+        on_chunk_done=_adj_chunk_progress,
+    )
+    affected = sorted(set(affected))
+    _refresh_single_view(repo, "adj_factor")
+    emit("sync_adj", 65,
+         f"除权因子完成,新增 {written_adj} 行,因子变更 {len(affected)} 只")
+    _invalidate("adj_factor")
+
+    # enriched 局部重算: 与管道「无新日期 + 有新除权因子」分支同语义 (只重算受影响个股)
+    enriched_dir = repo.store.data_dir / "kline_daily_enriched"
+    enriched_exists = enriched_dir.exists() and any(enriched_dir.glob("date=*"))
+    written_enriched = 0
+    if affected and enriched_exists:
+        def _enriched_batch_progress(cur: int, tot: int) -> None:
+            emit("compute_enriched", 65 + int(30 * cur / tot),
+                 f"计算指标 批次 {cur}/{tot}", stage_pct=int(100 * cur / tot), skip_log=True)
+
+        emit("compute_enriched", 65, f"增量计算 enriched ({len(affected)} 只个股)…")
+        logger.info("compute_enriched: adj_factor incremental (standalone), %d symbols", len(affected))
+        written_enriched = run_pipeline(symbols=affected, on_batch_done=_enriched_batch_progress)
+        _refresh_single_view(repo, "kline_enriched")
+        emit("compute_enriched", 95, f"enriched 完成,{len(affected)} 只个股")
+        _invalidate("enriched")
+    elif affected:
+        logger.info("standalone adj sync: enriched 未构建, 跳过局部重算 (交由盘后管道全量计算)")
+
+    emit("done", 100, "完成")
+    return {
+        "universe_size": len(universe),
+        "adj_written": written_adj,
+        "adj_factor_symbols": len(affected),
+        "enriched_days": written_enriched,
+        "skipped_stages": [],
+    }
+
+
 def warn_if_enriched_too_thin(data_dir: Path) -> int:
     """enriched 总覆盖天数; 低于常见指标暖机窗口时 WARN 引导全量回填 (#303)。
 
@@ -875,7 +997,7 @@ def warn_if_enriched_too_thin(data_dir: Path) -> int:
     days = enriched_history_days(data_dir)
     if days < MIN_INDICATOR_WARMUP_DAYS:
         logger.warning(
-            "enriched 仅覆盖 %d 个交易日 (<%d): 指标暖机不足, 选股可能全部 0 命中且无提示 — "
+            "enriched 仅覆盖 %d 个交易日 (<%d): 指标暖机不足, 策略可能全部 0 命中且无提示 — "
             "建议全量回填 (同步标的维表 → 日K批量同步(带后缀符号) → 重算 enriched)",
             days, MIN_INDICATOR_WARMUP_DAYS,
         )
@@ -968,7 +1090,13 @@ def _run_tracked(fn, job_label: str) -> bool:
     重任务执行槽: 再挡一层僵尸并发(reap 后线程仍活时不得并行写 parquet)。
     返回 True 仅表示任务已成功并且执行槽已释放。
     """
-    from app.services.pipeline_jobs import JobCancelledError, job_store, release_run_slot, run_with_capacity, try_acquire_run_slot
+    from app.services.pipeline_jobs import (
+        JobCancelledError,
+        job_store,
+        release_run_slot,
+        run_with_capacity,
+        try_acquire_run_slot,
+    )
 
     job_id, is_new = job_store.create()
     if not is_new:
@@ -1032,8 +1160,8 @@ async def _run_scheduled_review(repo) -> None:
     import json
 
     try:
-        from app.services import market_recap_reports
         from app import secrets_store as ss
+        from app.services import market_recap_reports
 
         # AI Key 未配置时跳过(避免每日报错刷日志)
         if not ss.get_ai_key():
@@ -1098,6 +1226,7 @@ async def _stream_review_with_retry(repo, quote_service, depth_service) -> tuple
     """
     import asyncio
     import json
+
     from app.services.market_recap import recap_market_stream
 
     max_attempts = 3  # 初次 + 2 次重试

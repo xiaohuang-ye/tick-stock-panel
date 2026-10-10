@@ -11,7 +11,6 @@ interface Props {
 }
 
 const SOURCE_CLS: Record<string, string> = {
-  builtin: 'bg-accent/10 text-accent border-accent/20',
   custom: 'bg-amber-400/10 text-amber-400 border-amber-400/30',
   ai: 'bg-purple-500/10 text-purple-400 border-purple-500/20',
   // 叠加策略归入「自定义」分组展示, 徽标与 StrategyCard 一致用 teal 区分
@@ -20,7 +19,6 @@ const SOURCE_CLS: Record<string, string> = {
 }
 
 const SOURCE_LABEL: Record<string, string> = {
-  builtin: '内置',
   custom: '自定义',
   ai: 'AI',
   composite: '叠加',
@@ -29,11 +27,10 @@ const SOURCE_LABEL: Record<string, string> = {
 
 const TF_BADGE_CLS = 'text-[8px] px-1 py-px rounded border leading-tight shrink-0 border-sky-500/30 bg-sky-500/10 text-sky-400'
 
-type SourceTab = 'all' | 'builtin' | 'custom' | 'ai'
+type SourceTab = 'all' | 'custom' | 'ai'
 
 const TABS: { id: SourceTab; label: string }[] = [
   { id: 'all', label: '全部' },
-  { id: 'builtin', label: '内置' },
   { id: 'custom', label: '自定义' },
   { id: 'ai', label: 'AI' },
 ]
@@ -95,9 +92,11 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
     [allStrategies, draftPool]
   )
 
-  // research_only 草稿(AI 来源)单独列出, 供「发布」操作; 不进待选列表
+  // research_only 草稿(AI 来源)单独列出, 供「发布」操作; 不进待选列表。
+  // 发布闸(/{id}/publish)仅接受 source=ai, 非 AI 的 research 项(如内置研究模板
+  // factor_rank_research)混入会渲染出必然失败的「发布」按钮, 故此处排除。
   const drafts = useMemo(
-    () => allStrategies.filter(s => s.research_only),
+    () => allStrategies.filter(s => s.research_only && s.source === 'ai'),
     [allStrategies]
   )
 
@@ -329,8 +328,8 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                           </span>
                           <span className="text-[10px] text-muted truncate block">{s.description}</span>
                         </span>
-                        <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[s.source] ?? SOURCE_CLS.builtin}`}>
-                          {SOURCE_LABEL[s.source] ?? '内置'}
+                        <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[s.source] ?? SOURCE_CLS.custom}`}>
+                          {SOURCE_LABEL[s.source] ?? '自定义'}
                         </span>
                         {s.timeframes?.includes('1m') && (
                           <span className={TF_BADGE_CLS}>分钟</span>
@@ -386,8 +385,8 @@ export function StrategyPoolDialog({ pool, onConfirm, onClose }: Props) {
                             <span className="flex-1 min-w-0 text-[12px] text-foreground truncate">
                               {s?.name ?? id} <span className="text-[10px] text-muted font-mono">{id}</span>
                             </span>
-                            <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[src] ?? SOURCE_CLS.builtin}`}>
-                              {SOURCE_LABEL[src] ?? '内置'}
+                            <span className={`text-[8px] px-1 py-px rounded border leading-tight shrink-0 ${SOURCE_CLS[src] ?? SOURCE_CLS.custom}`}>
+                              {SOURCE_LABEL[src] ?? '自定义'}
                             </span>
                             {s?.timeframes?.includes('1m') && (
                               <span className={TF_BADGE_CLS}>分钟</span>
