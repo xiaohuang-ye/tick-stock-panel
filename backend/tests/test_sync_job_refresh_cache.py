@@ -216,7 +216,7 @@ def test_sync_symbol_invalidates_storage_cache(monkeypatch, tmp_path):
     repo = _RepoStub(tmp_path)
     monkeypatch.setattr(
         kline_sync, "sync_and_persist_daily_batch",
-        lambda symbols, _repo, _capset, count=None: 5,
+        lambda symbols, _repo, _capset, count=None, zero_row_out=None: 5,
     )
     invalidated: list = []
     monkeypatch.setattr(

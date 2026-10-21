@@ -90,7 +90,7 @@ async def _submit_job(repo, quote_service, make_run) -> dict:
                 ctx = qs.paused() if qs else nullcontext()
                 with ctx:
                     try:
-                        return daily_pipeline.run_now(repo, capset, on_progress=progress)
+                        return run()
                     finally:
                         refresh_repo_cache_safely(repo)
 
