@@ -755,6 +755,39 @@ def invalidate_intraday_cache() -> None:
 _names_cache: dict[Path, tuple[object, dict[str, str]]] = {}
 
 
+def seed_if_empty(data_dir: Path) -> int:
+    """去内置化迁移: 首次运行种入 20 个默认信号定义 (与已有用户定义共存)。
+
+    - 幂等: ``.seeded_v1`` 标记存在 (无论目录后来是否被用户清空) 不再种入,
+      用户删除全部信号后重启不会"复活"。
+    - 仅写目录中缺失的 id, 已有文件一律不覆盖: 旧环境整体拷贝 (已含全部
+      种子) 时零写入; 仅有旧版自定义信号的升级用户也能拿到默认信号。
+      (曾因「目录非空即整体跳过」令升级用户丢失内置涨跌停信号,
+      表现为看板跌停恒 0、连板梯队无数据。)
+    - 历史遗留: 旧逻辑写过 ``skipped: user signals present`` 标记, 该标记
+      同样视为未种子化, 升级后自动补种缺失项。
+    """
+    from app.strategy.signal_seeds import SEED_SIGNALS
+
+    d = _dir(data_dir)
+    marker = d / ".seeded_v1"
+    if marker.exists():
+        try:
+            if "skipped" not in marker.read_text(encoding="utf-8"):
+                return 0
+        except OSError:
+            return 0
+    existing = {p.stem for p in d.glob("*.json")}
+    written = 0
+    for sig in SEED_SIGNALS:
+        if sig["id"] in existing:
+            continue
+        save_one(data_dir, sig)
+        written += 1
+    marker.write_text(f"seeded: {written}\n", encoding="utf-8")
+    return written
+
+
 def signal_names(data_dir: Path) -> dict[str, str]:
     """自定义信号列名 (csg_/csgi_) → 用户命名的映射, 带目录指纹缓存。
 

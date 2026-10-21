@@ -19,6 +19,7 @@ import { WatchlistAddMenu } from '@/components/WatchlistAddMenu'
 import { useStrategyPool } from '@/lib/useStrategyPool'
 import { StrategyCard, CardSize, loadCardSize, cardWrapCls } from '@/components/screener/StrategyCard'
 import { ScreenerTable } from '@/components/screener/ScreenerTable'
+import type { MiniIntradayYMode } from '@/components/stock-table/MiniIntraday'
 import { ScreenerFilter as ScreenerFilterType, defaultFilter, filterActive, countActiveFilters, applyFilter, FilterPanel } from '@/components/screener/ScreenerFilter'
 import { StrategySettingsDialog } from '@/components/screener/StrategySettingsDialog'
 import { DefaultStrategyParamsDialog } from '@/components/screener/DefaultStrategyParamsDialog'
@@ -29,6 +30,7 @@ import { CompositeStrategyDialog } from '@/components/screener/CompositeStrategy
 import { ListColumnCustomizer } from '@/components/ListColumnCustomizer'
 import { useTableSort } from '@/components/stock-table/useTableSort'
 import { resolveCandleConfig } from '@/lib/list-columns'
+import { useAuctionConfig, useAuctionSeries } from '@/lib/intraday-auction'
 import {
   SCREENER_BUILTIN_COLUMNS,
   SCREENER_COLUMN_GROUPS,
@@ -82,6 +84,16 @@ export function Screener() {
     setIntradayChartVisible(v => {
       const next = !v
       storage.screenerIntraday.set(next)
+      return next
+    })
+  }, [])
+  // 分时纵轴模式: adaptive=实际价格区间, limit=按涨跌停带 (持久化)
+  const [intradayYMode, setIntradayYMode] = useState<MiniIntradayYMode>(() =>
+    storage.screenerIntradayYMode.get('adaptive') === 'limit' ? 'limit' : 'adaptive')
+  const toggleIntradayYMode = useCallback(() => {
+    setIntradayYMode(v => {
+      const next: MiniIntradayYMode = v === 'adaptive' ? 'limit' : 'adaptive'
+      storage.screenerIntradayYMode.set(next)
       return next
     })
   }, [])
@@ -170,6 +182,12 @@ export function Screener() {
   // 卡片首屏只读取轻量摘要；明细在点击策略或“全部”时按需加载。
   // 摘要只覆盖日线缓存; 分钟策略命中数来自手动单跑。
   // run_all 渐进式返回后后台仍在算 → 轮询摘要, 算完的策略逐个点亮。
+  //
+  // 后端会用当前实时行情覆盖结果里的价格类字段 (close/change_pct 等), 所以
+  // 交易时段内需要定期重取, 否则列表一直停在首次加载那一刻的涨跌幅, 与详情
+  // 弹窗的实时价对不上。摘要没有价格字段, 仍只在 run_all 未完成时轮询。
+  const quoteStatus = useQuoteStatus()
+  const inTradingSession = quoteStatus.data?.is_trading_hours !== false
   const summaryQuery = useQuery({
     queryKey: QK.screenerCachedSummary,
     queryFn: api.screenerCachedSummary,
@@ -181,6 +199,8 @@ export function Screener() {
     queryKey: QK.screenerCached(asOf, extColumnsParam),
     queryFn: () => api.screenerCached(extColumnsParam || undefined),
     enabled: assetType === 'stock' && tfFilter !== '1m' && showAll,
+    // 交易时段跟随行情轮询; 收盘后价格不再变, 降为 60s 仅兜底数据修正
+    refetchInterval: inTradingSession ? 6_000 : 60_000,
   })
 
   const singleCachedQuery = useQuery({
@@ -191,6 +211,8 @@ export function Screener() {
       && !showAll
       && !!activeStrategy
       && summaryQuery.data?.results[activeStrategy]?.as_of === asOf,
+    // 与 fullCachedQuery 同口径: 列表与详情共享同一份实时覆盖后的价格
+    refetchInterval: inTradingSession ? 6_000 : 60_000,
   })
 
   const dataStatus = useDataStatus({ staleTime: 0 })
@@ -265,6 +287,30 @@ export function Screener() {
     prune(allStrategyIds)
   }, [allStrategyIds, prune, strategies.isError, strategies.isSuccess])
 
+  // 去内置化一次性迁移提示: 后端启动时自动种入原内置策略/默认信号/归档失效策略,
+  // 摘要只在首次见到时提示一次 (localStorage 记录迁移指纹)。
+  const legacyMigration = strategies.data?.legacy_migration
+  useEffect(() => {
+    if (!legacyMigration) return
+    const fingerprint = JSON.stringify(legacyMigration)
+    const key = 'tsp-legacy-migration-v1'
+    try {
+      if (localStorage.getItem(key) === fingerprint) return
+      localStorage.setItem(key, fingerprint)
+    } catch { /* 隐私模式等存储不可用: 退化为每次提示 */ }
+    const parts: string[] = []
+    if (legacyMigration.seeded_strategies) {
+      parts.push(`已补回 ${legacyMigration.seeded_strategies} 个原内置策略为自定义策略(可在策略页编辑或删除)`)
+    }
+    if (legacyMigration.seeded_signals) {
+      parts.push(`已将 ${legacyMigration.seeded_signals} 个原内置信号转为自定义信号(可在信号库编辑)`)
+    }
+    if (legacyMigration.archived_files?.length) {
+      parts.push(`已归档 ${legacyMigration.archived_files.length} 个无法加载的旧策略文件(位于 data/strategies/*/_archive_unloadable/)`)
+    }
+    if (parts.length) toast(`旧版数据自动迁移完成：${parts.join('；')}`, 'success')
+  }, [legacyMigration])
+
   // 策略文件加载失败时提示用户(避免"策略静默消失"被误判为正常)。
   // 多个失败聚合为一条, 避免旧数据目录升级后 (内置模块移除/叠加断链) 刷屏。
   const loadErrors = strategies.data?.load_errors ?? []
@@ -319,6 +365,8 @@ export function Screener() {
 
   // 分钟策略批量计算: 结果不落盘后缓存 (strategy_cache 为日线语义), 只取 total
   // 合入 hitCounts 点亮卡片。传空日期让后端用分钟分区自身最新交易日 (与单跑同口径)。
+  // 与日线同走渐进式: 慢策略转后台, 结果经 cached-summary 合入, pending 复用
+  // 同一套 2s 轮询点亮 (arrived 判据用 computed_at)。
   const runAllMinute = useMutation({
     mutationFn: (strategyIds: string[]) =>
       api.screenerRunAll(undefined, strategyIds, assetType, '1m'),
@@ -328,6 +376,11 @@ export function Screener() {
         counts[id] = item.total
       }
       if (Object.keys(counts).length) setHitCounts(prev => ({ ...prev, ...counts }))
+      setPendingRun(
+        data.pending?.length
+          ? { ids: [...data.pending], startedAt: data.started_at ?? 0 }
+          : null,
+      )
     },
     onError: (e) => toast(`分钟策略计算失败：${String((e as any).message ?? e)}`, 'error'),
   })
@@ -547,7 +600,6 @@ export function Screener() {
   //  - 刷新: minute_intraday_refresh 偏好开启时按用户设定间隔轮询; 否则仅首次加载,
   //    用户可点表头刷新按钮手动更新
   const minuteBatchCap = caps.data?.capabilities?.['kline.minute.batch']?.batch ?? 100
-  const quoteStatus = useQuoteStatus()
   const realtimeRunning = quoteStatus.data?.running ?? false
   const intradayRefreshEnabled = prefs?.minute_intraday_refresh ?? false
   const intradayRefreshInterval = prefs?.minute_intraday_refresh_interval ?? 6
@@ -579,6 +631,42 @@ export function Screener() {
     refetchInterval: (intradayRefreshEnabled && realtimeRunning) ? intradayRefreshInterval * 1000 : false,
   })
   const minuteData = intradayVisible ? (minuteBatch.data?.data ?? {}) : {}
+
+  // 日内多盘扩展列 (集合竞价等) 迷你图: 每个 bar/line 图列按可见页标的拉当天序列
+  const extChartColumns = useMemo(
+    () => columns.filter(c =>
+      c.visible && c.source.type === 'ext'
+      && (c.extDisplay?.snapshotRender === 'bar' || c.extDisplay?.snapshotRender === 'line')),
+    [columns],
+  )
+  const extChartColsKey = extChartColumns
+    .map(c => `${(c.source as { configId: string }).configId}.${(c.source as { fieldName: string }).fieldName}`)
+    .join(',')
+  const extChartSymbolsKey = useMemo(
+    () => [...new Set(displayRows.map((r: any) => r.symbol as string))].sort().join(','),
+    [displayRows],
+  )
+  const extSeriesQuery = useQuery({
+    queryKey: QK.extSeries(extChartColsKey, asOf, extChartSymbolsKey),
+    queryFn: async () => {
+      const symbols = extChartSymbolsKey ? extChartSymbolsKey.split(',') : []
+      const entries = await Promise.all(extChartColumns.map(async c => {
+        const src = c.source as { type: 'ext'; configId: string; fieldName: string }
+        const r = await api.extDataSeries(src.configId, src.fieldName, asOf || undefined, symbols)
+        return [`${src.configId}.${src.fieldName}`, r.items ?? {}] as const
+      }))
+      return Object.fromEntries(entries) as Record<string, Record<string, [string, number][]>>
+    },
+    enabled: extChartColumns.length > 0 && extChartSymbolsKey.length > 0,
+    staleTime: 5 * 60_000,
+    placeholderData: prev => prev,
+  })
+  const extSeriesData = extChartColumns.length ? (extSeriesQuery.data ?? {}) : {}
+
+  // 分时列集合竞价叠加: 左侧窄栏价格/匹配量/未匹配量 (按 asOf 取同日分区)
+  const auctionCfg = useAuctionConfig(columns)
+  const auctionSymbols = useMemo(() => displayRows.map((r: any) => r.symbol as string), [displayRows])
+  const auctionData = useAuctionSeries(auctionCfg, auctionSymbols, asOf)
 
   // asOf 确定后 + 策略列表就绪 + 策略池非空 → 自动跑一次 (受系统设置开关控制)
   // 缓存命中时秒加载; 未命中时, 仅当 screener_auto_run 开启才自动触发 runAll
@@ -766,7 +854,13 @@ export function Screener() {
         title="策略"
         subtitle="基于本地 enriched 表 · 毫秒级 SQL"
         right={
-          <div className="flex items-center gap-2 flex-nowrap overflow-x-auto max-w-full [&>*]:shrink-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          /* 工具栏 10 组控件总宽会超过标题栏 (窄屏实测溢出 148px)。
+             不能靠 overflow-x-auto + 隐藏滚动条 —— 那样右侧按钮被静默裁掉,
+             用户既看不到也滚不到 (「创建策略 · AI」曾整块消失)。
+             改用 flex-wrap: 空间不足时折到第二行, 全部控件始终可达。
+             间距取 1.5 (6px): 1440px 宽下总占位 939+54=993px, 刚好单行放下;
+             8px 间距则是 1011px, 会在 1440 只剩一个按钮孤零零折行。 */
+          <div className="flex flex-wrap items-center justify-end gap-1.5">
             {/* 资产类型切换: 股票 / ETF (分钟策略 asset_types 仅股票, ETF 列表自然不含) */}
             <div className="flex items-center h-7 rounded-btn border border-border overflow-hidden">
               {(['stock', 'etf'] as const).map(t => (
@@ -930,10 +1024,25 @@ export function Screener() {
             </div>
           )}
           {!strategies.isLoading && !strategies.isError && displayPool.length === 0 && (
-            <div className="text-sm text-muted py-4 text-center border border-dashed border-border rounded-btn">
-              {pool.length === 0
-                ? '策略池为空，点击右上角「策略池」按钮添加策略'
-                : '当前周期筛选下无策略，切换周期筛选或编辑策略池'}
+            <div className="py-4 text-center border border-dashed border-border rounded-btn">
+              <div className="text-sm text-muted">
+                {pool.length === 0
+                  ? '策略池为空，点击右上角「策略池」按钮添加策略'
+                  : '当前周期筛选下无策略，切换周期筛选或编辑策略池'}
+              </div>
+              {/* 池空时补文档入口: 用户此刻最需要的是「怎么造一个策略」, 而文档路径
+                  在界面上不可发现 —— 补上下文提到的三份指南, 与其它页引用 docs 同款
+                  (等宽文本而非链接: 这些是仓库内文件, 浏览器里点不开)。 */}
+              {pool.length === 0 && (
+                <div className="mt-2 flex flex-wrap items-center justify-center gap-x-1.5 gap-y-1 text-[11px] leading-relaxed text-muted/80">
+                  <span>自己写策略看</span>
+                  <code className="rounded bg-elevated/70 px-1 py-px font-mono text-[10px] text-secondary">docs/strategy.md</code>
+                  <span>（三种扩展方式：自定义信号 / AI 生成 / 手写代码）</span>
+                  <span className="text-border" aria-hidden="true">·</span>
+                  <span>用 AI 迭代已有策略看</span>
+                  <code className="rounded bg-elevated/70 px-1 py-px font-mono text-[10px] text-secondary">docs/strategy-iteration.md</code>
+                </div>
+              )}
             </div>
           )}
           <div className={cardWrapCls(cardSize)}>
@@ -1141,10 +1250,15 @@ export function Screener() {
                     intradayAutoRefresh={intradayRefreshEnabled && realtimeRunning}
                     onRefreshIntraday={() => minuteBatch.refetch()}
                     intradayRefreshing={minuteBatch.isFetching}
+                    intradayYMode={intradayYMode}
+                    onToggleIntradayYMode={toggleIntradayYMode}
+                    assetType={assetType}
                     strategyTagsExpanded={strategyTagsExpanded}
                     onToggleStrategyTags={toggleStrategyTags}
                     sort={sort}
                     onSortToggle={toggle}
+                    extSeriesData={extSeriesData}
+                    auctionData={auctionData}
                   />
                 </>
               )}
@@ -1157,8 +1271,18 @@ export function Screener() {
                 <ScanSearch className="h-7 w-7 text-accent/40" />
               </div>
               <div className="flex flex-col items-center gap-1.5">
-                <span className="text-sm text-secondary">点击策略卡片查看策略结果</span>
-                <span className="text-[11px] text-muted">若提示 enriched 表无数据，请先运行盘后管道</span>
+                {/* 池空时没有卡片可点, 原文案「点击策略卡片」会指向不存在的操作 */}
+                {pool.length === 0 ? (
+                  <>
+                    <span className="text-sm text-secondary">还没有策略，先添加或创建一个</span>
+                    <span className="text-[11px] text-muted">用右上角「创建策略 · AI」生成，或按上方文档手写</span>
+                  </>
+                ) : (
+                  <>
+                    <span className="text-sm text-secondary">点击策略卡片查看策略结果</span>
+                    <span className="text-[11px] text-muted">若提示 enriched 表无数据，请先运行盘后管道</span>
+                  </>
+                )}
               </div>
             </div>
           )}

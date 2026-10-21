@@ -30,6 +30,7 @@ from app.enriched_generation import (
     EnrichedGenerationUnavailableError,
     EnrichedPublication,
     bump_enriched_generation,
+    enriched_publication_incomplete,
     get_enriched_generation,
 )
 from app.market_time import cn_today
@@ -38,6 +39,12 @@ from app.polars_guard import guarded_collect
 from app.services.minute_adjust import apply_minute_adjustment, minute_basis_is_raw
 
 logger = logging.getLogger(__name__)
+
+# GH #480: 后台 warmup 因世代漂移被丢弃时的有界重建上限。compute 窗口长达
+# 数十秒, 启动期与 quote 实时刷新的 commit 撞车后若不重建, 历史缓存长期
+# 为空, K 线接口逐请求现算指标。仅 warmup 线程用, 同步/懒加载路径单次。
+_ENRICHED_WARMUP_MAX_ATTEMPTS = 3
+_ENRICHED_WARMUP_PUBLISH_WAIT_SECONDS = 5.0
 
 
 def replace_with_retry(src: Path, dst: Path, *, attempts: int = 10, delay_s: float = 0.5) -> None:
@@ -146,11 +153,15 @@ class DataStore:
         self._register_views()
 
     def _migrate_legacy_data_dir(self) -> None:
-        """把旧桌面版数据目录 (<安装目录>/../TickFlowStockPanel_Data/) 迁移到新位置 (<安装目录>/data/)。
+        """把旧版数据目录迁移到当前位置 (打包桌面版, 首次启动自动搬迁)。
 
-        背景: 旧版 data_dir = exe_dir.parent / "TickFlowStockPanel_Data" (兄弟目录),
-        新版改为 exe_dir / "data" (子目录)。老用户首次升级时旧数据在兄弟目录,
-        若不迁移会导致历史行情/策略/回测/监控全部"丢失"(实际还在旧位置)。
+        legacy 候选 (逐个尝试, 命中即搬):
+          1. data_dir.parent / "TickFlowStockPanel_Data" —— Windows 旧版兄弟目录
+             (旧版 data_dir = exe_dir.parent / "TickFlowStockPanel_Data", 新版改子目录)。
+          2. macOS ≤0.3.6 的 .app 包内数据 (exe 同级 data/) —— 数据在包内时
+             覆盖安装替换 App 会连数据一起进废纸篓; 修复后 data 移到
+             ~/Library/Application Support/TSP, 用户把包内数据找回/恢复进新包
+             (或从 dmg 直接运行过) 的场景由此接住并搬出。
 
         策略 (仅打包桌面版触发, 开发/Docker 不受影响):
           1. 旧目录存在且新 data/ 还基本为空 → 整目录搬迁 (shutil.move, 跨盘符安全)。
@@ -165,41 +176,49 @@ class DataStore:
         import shutil
 
         try:
-            legacy_dir = self.data_dir.parent / "TickFlowStockPanel_Data"
-            if not legacy_dir.exists():
-                return  # 新装用户, 无旧数据
+            candidates: list[Path] = [
+                self.data_dir.parent / "TickFlowStockPanel_Data",
+            ]
+            if sys.platform == "darwin":
+                candidates.append(Path(sys.executable).resolve().parent / "data")
 
-            # 新 data/ 目录里已有实质性内容 → 用户已在新路径跑过, 不覆盖
-            # (用 .parquet 作为"有真实数据"的判据, 避免空子目录误判)
-            has_new_data = any(self.data_dir.rglob("*.parquet")) or any(
-                self.data_dir.rglob("*.jsonl")
-            )
-            if has_new_data:
-                logger.info(
-                    "legacy data dir %s exists but new %s already has data, skip migration",
-                    legacy_dir, self.data_dir,
+            for legacy_dir in candidates:
+                if not legacy_dir.exists():
+                    continue
+                if legacy_dir.resolve() == self.data_dir.resolve():
+                    continue  # 防御: 同一路径 (理论上不会出现) 不做任何事
+
+                # 新 data/ 目录里已有实质性内容 → 用户已在新路径跑过, 不覆盖
+                # (用 .parquet 作为"有真实数据"的判据, 避免空子目录误判)
+                has_new_data = any(self.data_dir.rglob("*.parquet")) or any(
+                    self.data_dir.rglob("*.jsonl")
                 )
-                return
+                if has_new_data:
+                    logger.info(
+                        "legacy data dir %s exists but new %s already has data, skip migration",
+                        legacy_dir, self.data_dir,
+                    )
+                    continue
 
-            logger.info("migrating legacy data %s -> %s", legacy_dir, self.data_dir)
-            # 逐项 move 而非整目录 move: data/ 可能已被 __init__ 创建了空子目录,
-            # 直接 shutil.move(legacy, data) 会因目标已存在失败。
-            for item in legacy_dir.iterdir():
-                dest = self.data_dir / item.name
-                if dest.exists():
-                    # 同名子目录 (如 kline_daily): 合并内容
-                    if dest.is_dir():
-                        shutil.move(str(item), str(dest / item.name))
+                logger.info("migrating legacy data %s -> %s", legacy_dir, self.data_dir)
+                # 逐项 move 而非整目录 move: data/ 可能已被 __init__ 创建了空子目录,
+                # 直接 shutil.move(legacy, data) 会因目标已存在失败。
+                for item in legacy_dir.iterdir():
+                    dest = self.data_dir / item.name
+                    if dest.exists():
+                        # 同名子目录 (如 kline_daily): 合并内容
+                        if dest.is_dir():
+                            shutil.move(str(item), str(dest / item.name))
+                        else:
+                            item.unlink()  # 同名文件, 以新路径为准, 删旧
                     else:
-                        item.unlink()  # 同名文件, 以新路径为准, 删旧
-                else:
-                    shutil.move(str(item), str(dest))
-            # 搬完后清理空的旧目录
-            try:
-                shutil.rmtree(legacy_dir)
-            except OSError:
-                logger.warning("legacy dir %s not empty, kept", legacy_dir)
-            logger.info("legacy data migration done")
+                        shutil.move(str(item), str(dest))
+                # 搬完后清理空的旧目录
+                try:
+                    shutil.rmtree(legacy_dir)
+                except OSError:
+                    logger.warning("legacy dir %s not empty, kept", legacy_dir)
+                logger.info("legacy data migration done")
         except Exception as e:  # noqa: BLE001
             logger.warning("legacy data migration failed (startup continues): %s", e)
 
@@ -478,6 +497,8 @@ class KlineRepository:
 
         仿 QuoteService 的线程模式: 设 warming 标志 → 起 daemon → 完成后清标志 +
         触发回调。重复调用时若已有线程在跑则跳过 (避免重复预热)。
+        预热走 _warmup_enriched: 世代漂移导致丢弃时有界重建 (GH #480),
+        同步/懒加载路径仍走单次 _refresh_enriched, 不阻塞 HTTP。
         """
         with self._warmup_lock:
             if self._enriched_warming:
@@ -489,7 +510,7 @@ class KlineRepository:
             t0 = time.perf_counter()
             try:
                 logger.info("enriched warmup thread started")
-                self._refresh_enriched()
+                self._warmup_enriched()
                 logger.info("enriched warmup thread done (%.1fs)", time.perf_counter() - t0)
                 self._notify_refresh_done()
             except Exception:  # noqa: BLE001
@@ -555,11 +576,42 @@ class KlineRepository:
         self._index_enriched_cache = None
         self._index_enriched_cache_date = None
 
-    def _refresh_enriched(self) -> None:
+    def _refresh_enriched(self) -> bool:
+        """刷新 enriched 内存缓存。返回 True 表示因数据换代被丢弃、可重试。
+
+        返回 False 覆盖两种情形: 成功建成, 或非换代失败 (不重试, 保持降级)。
+        现有调用方均不读返回值, 行为不变; 仅后台 warmup 线程用返回值做有界重建。
+        """
         from app.services.heavy_job_limiter import shared_heavy_job_limiter
 
         with shared_heavy_job_limiter.slot("exclusive"):
-            self._refresh_enriched_impl()
+            try:
+                self._refresh_enriched_impl()
+            except EnrichedGenerationUnavailableError as e:
+                logger.warning("enriched 历史缓存因数据换代被丢弃 (可重试): %s", e)
+                return True
+            except Exception as e:  # noqa: BLE001
+                logger.warning("enriched 缓存刷新失败: %s", e)
+                return False
+        return False
+
+    def _warmup_enriched(self) -> None:
+        """仅后台预热线程调用: 世代漂移导致丢弃时以新世代有界重建。
+
+        warmup 的 compute 窗口长达数十秒, 启动期与 quote 实时刷新的 commit
+        撞车概率高; 丢弃后不重建会把缓存长期留冷, K 线接口逐请求现算指标
+        (GH #480)。每轮重新捕获世代、各自仍 fail-closed; 发布未完成时短暂
+        等待再试; 超过上限则放弃并保持冷缓存降级 (非无限重读)。
+        """
+        for attempt in range(_ENRICHED_WARMUP_MAX_ATTEMPTS):
+            if attempt and enriched_publication_incomplete(self.store.data_dir, "stock"):
+                time.sleep(_ENRICHED_WARMUP_PUBLISH_WAIT_SECONDS)
+            if not self._refresh_enriched():
+                return
+        logger.warning(
+            "enriched 历史缓存预热因持续换代被丢弃, %d 轮后放弃 (保持冷缓存降级)",
+            _ENRICHED_WARMUP_MAX_ATTEMPTS,
+        )
 
     def _refresh_enriched_impl(self) -> None:
         """从 parquet 加载 enriched 最新日到内存 + 构建聚合表。
@@ -694,8 +746,9 @@ class KlineRepository:
 
             logger.info("enriched 缓存已加载: %d 只, 日期 %s", len(df_latest), latest)
             logger.info("enriched refresh done fallback (%.2fs)", time.perf_counter() - started)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("enriched 缓存刷新失败: %s", e)
+        except EnrichedGenerationUnavailableError:
+            # 换代丢弃上抛给 _refresh_enriched: 后台 warmup 可重试, 同步路径记 warning 降级
+            raise
 
     def _restore_missing_latest_rows(
         self,
@@ -2343,8 +2396,16 @@ class KlineRepository:
         if publication is None:
             self._atomic_write_parquet(merged, out)
         else:
-            publication.write_parquet(merged, out)
-            publication.commit()
+            # 写/提交失败必须结束发布会话, 否则一次瞬时失败会把 publishing
+            # 标记挂到心跳超时, 期间所有读写都报"正在发布"。abandon 按是否
+            # 已有分区落盘决定: 未写入 → 恢复 ready; 已写入 → 保持 fail-closed
+            # (磁盘可能已换新内容, 不能沿用旧 generation 放行缓存)。
+            try:
+                publication.write_parquet(merged, out)
+                publication.commit()
+            except BaseException:
+                publication.abandon()
+                raise
 
     def merge_live_daily_asset(self, asset_type: str, df: pl.DataFrame) -> None:
         """按 symbol 合并当天指定资产日K分区。用于少量自选实时，不覆盖全市场。"""

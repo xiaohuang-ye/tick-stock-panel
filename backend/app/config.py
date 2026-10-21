@@ -22,11 +22,18 @@ def _user_data_root() -> Path:
 
     定位策略 (按优先级):
       1. 环境变量 DATA_DIR (pydantic-settings 自动注入到 settings.data_dir, 不在此处理)
-      2. 打包桌面版: exe 同级的 data/ 子目录 (<安装目录>/data/)
-         —— 与程序同处一个总目录 (用户选择的安装目录), 视觉直观, 便于备份/迁移。
+      2. 打包桌面版:
+         - macOS: ~/Library/Application Support/TSP —— 必须在 .app 包外。
+           升级用新 TSP.app 替换旧包时 Finder 会把整个旧包移入废纸篓,
+           数据放包内 (≤0.3.6 的 exe 同级 data) 等于每次覆盖安装都被清空;
+           App Support 是 mac 用户数据惯例位置, 替换 .app 永不触碰,
+           也规避向 /Applications 包内写入的权限问题。包内旧数据由
+           KlineRepository._migrate_legacy_data_dir() 首次启动自动搬出。
+         - Windows/Linux: exe 同级的 data/ 子目录 (<安装目录>/data/)
+           —— 与程序同处一个总目录 (用户选择的安装目录), 视觉直观, 便于备份/迁移。
       3. 非 frozen (开发模式): 项目根 data/
 
-    为什么不用 platformdirs 默认 (%LOCALAPPDATA%) 作为主路径:
+    为什么 Windows 不用 platformdirs 默认 (%LOCALAPPDATA%) 作为主路径:
       - 落在 C 盘系统目录, 用户不易察觉, 占系统盘空间
       - 用户期望「数据跟随程序」(便于备份/迁移)
     为什么放 {app}/data (exe 旁的 data/) 而非 {app} 外的兄弟目录:
@@ -34,10 +41,14 @@ def _user_data_root() -> Path:
       - 数据安全: Inno Setup 覆盖安装(升级)时只往 {app} 写新程序文件, 不会清空
         目录里不在安装清单上的运行时文件 (data/ 即此类), 故覆盖安装不丢数据。
         (注意: 卸载时需在 .iss 中豁免 data/, 见 packaging/tsp.iss 的 [UninstallDelete]。)
-    旧版本数据迁移: 见 DataStore._migrate_legacy_data_dir(), 老用户首次启动自动搬迁。
+    旧版本数据迁移: 见 KlineRepository._migrate_legacy_data_dir(), 老用户首次启动自动搬迁。
     """
-    # 打包桌面版: exe 同级的 data/ 子目录 (与程序同一总目录, 覆盖安装不丢数据)
+    # 打包桌面版
     if _IS_FROZEN:
+        # macOS: 数据放 .app 包外 (升级替换 App 不丢数据), 位置为 mac 惯例路径
+        if sys.platform == "darwin":
+            return Path.home() / "Library" / "Application Support" / "TSP"
+        # Windows/Linux: exe 同级的 data/ 子目录 (与程序同一总目录, 覆盖安装不丢数据)
         exe_dir = Path(sys.executable).resolve().parent
         return exe_dir / "data"
 
@@ -84,6 +95,8 @@ class Settings(BaseSettings):
 
     # AI
     ai_provider: str = "openai_compat"
+    # OpenAI 系请求协议: chat_completions (兼容面最广) | responses (OpenAI 官方新协议)。
+    ai_protocol: str = "chat_completions"
     ai_base_url: str = "https://llm.runninghub.ai/v1"
     ai_api_key: str = ""
     ai_model: str = "openai/gpt-6-astra-saver"
@@ -137,6 +150,10 @@ class Settings(BaseSettings):
     # 到点后已算完的随响应返回, 未算完的转后台继续算并逐个写入策略缓存,
     # 前端轮询 cached-summary 点亮卡片。0 = 关闭 (整段阻塞, 旧行为)。
     strategy_run_all_first_return_s: float = 15.0
+
+    # 同步路由 (def) 线程池容量: Starlette/anyio 默认 40。看板自动刷新 +
+    # 多标签页 + 长计算路由并存时 40 容易排队, 调大仅提高上限 (按需创建)。
+    api_sync_thread_pool: int = 100
 
     # Auth — 首次启动时预置访问密码(明文, 仅用于初始化, 详见 services/auth.bootstrap_from_env)
     # 公网服务器部署时免去 SSH 端口转发设密码的麻烦。写入 auth.json(哈希)后即不再读取。

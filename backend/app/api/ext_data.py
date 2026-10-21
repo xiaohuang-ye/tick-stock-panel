@@ -95,6 +95,17 @@ class PullConfigReq(BaseModel):
     field_map: dict[str, str] | None = None  # external → internal field name
     schedule_minutes: int = Field(1440, ge=1)
     enabled: bool = False
+    # 每日固定拉取时刻 "HH:MM" (北京时间): 配置后按墙钟每天该时刻拉一次,
+    # 忽略 schedule_minutes; null = 间隔制 (清除固定时刻)
+    schedule_time: str | None = Field(
+        None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$"
+    )
+    # 固定时刻的重复周期: daily=每天 | weekly=每周 | monthly=每月 (仅 schedule_time 生效)
+    schedule_period: str | None = Field(None, pattern=r"^(daily|weekly|monthly)$")
+    # weekly: 1=周一..7=周日; monthly: 1..31 (短月无该日则该月跳过)
+    schedule_day: int | None = Field(None, ge=1, le=31)
+    # 仅交易日: 跳过周六日 (法定节假日无法离线判定, 仍会按期尝试, 拉取幂等)
+    schedule_trading_only: bool = False
     time_window_start: str | None = None   # "HH:MM", None=不限
     time_window_end: str | None = None     # "HH:MM", None=不限
     # 接口按日查询的参数名 (如 "date"): 配置后支持历史回补, 且当日拉取也带日期参数
@@ -108,6 +119,8 @@ class PullConfigReq(BaseModel):
     auth: PullAuthReq | None = None
     # 单次拉取请求超时 (秒), 默认 30 与历史行为一致; 大响应接口可调高
     timeout_seconds: int = Field(30, ge=5, le=300)
+    # 两级拉取配方 (目录 → 逐条目明细); 缺省 (None) = 保留现有配置
+    fanout: dict | None = None
 
 
 class ApiKeyReq(BaseModel):
@@ -407,27 +420,6 @@ def list_configs(request: Request):
     return {"items": items}
 
 
-@router.post("/presets/{config_id}/fetch")
-async def fetch_preset_data(request: Request, config_id: str):
-    """手动触发内置预设 (概念/行业) 的数据拉取。
-
-    注意: 必须在 /{config_id}/... 动态路由之前声明, 否则 'presets' 会被当成 config_id。
-    与通用 pull/run 不同: 走 ext_presets 的结构转换 (接口的 concepts/industries
-    数组 → 拼接成字符串), 保证 schema 与现有数据一致。
-    """
-    from app.services.ext_presets import fetch_preset
-
-    try:
-        n = await fetch_preset(config_id, _data_dir(request))
-    except ValueError as e:
-        raise HTTPException(404, str(e)) from e
-    except Exception as e:
-        raise HTTPException(400, f"拉取失败: {e}") from e
-
-    _refresh_views(request)
-    return {"status": "ok", "rows": n}
-
-
 @router.post("")
 def create_config(request: Request, body: CreateExtReq):
     """创建扩展数据配置。"""
@@ -687,6 +679,10 @@ _DIMENSION_INTRADAY_CACHE: dict[tuple[str, str, str, str | None], tuple[float, d
 _DIMENSION_INTRADAY_CACHE_TTL_S = 60.0
 # 成分股网格化 ffill 上限: 超大板块退化为逐时间戳可得均值 (内存保护)。
 _DIMENSION_INTRADAY_FFILL_CAP = 2000
+# 分钟 pct 物理边界 (与 services.sector_rotation._PCT_PHYSICAL_BOUND 同值,
+# A 股日涨跌停最大 ±30%): 超出视为脏点剔除 (GH #473 同族)。
+_DIMENSION_INTRADAY_PCT_BOUND = 0.30
+_DIMENSION_INTRADAY_PCT_EPS = 1e-9  # 浮点容差: 130/100-1 略大于 0.30, 真涨停勿滤
 
 
 def _bare_symbol_expr(col: str = "symbol") -> pl.Expr:
@@ -804,6 +800,8 @@ def _dimension_intraday_compute(
     joined = (
         joined.join(refs.select(["_bare", "_ref"]), on="_bare", how="left")
         .with_columns((pl.col("close") / pl.col("_ref") - 1.0).alias("_pct"))
+        # 物理边界外视为脏点剔除 (与 sector_rotation 同口径, GH #473 同族)
+        .filter(pl.col("_pct").abs() <= _DIMENSION_INTRADAY_PCT_BOUND + _DIMENSION_INTRADAY_PCT_EPS)
     )
 
     market = joined.group_by("datetime").agg(pl.col("_pct").mean().alias("_market"))
@@ -1016,6 +1014,23 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
 
     # 保留历史状态字段; auth 缺省时沿用现有配置 (关闭鉴权需显式传 {"type":"none"})
     old_pull = config.pull
+    # auth.key_ref / fanout: UI 未暴露的键在保存时沿用旧值, 避免一次普通保存
+    # 就把出厂配方里的凭据引用与两级请求配方抹掉。
+    old_auth = (old_pull.auth or {}) if old_pull else {}
+    if body.auth is not None:
+        new_auth: dict | None = body.auth.model_dump()
+        if new_auth and old_auth.get("key_ref") and not new_auth.get("key_ref"):
+            new_auth["key_ref"] = old_auth["key_ref"]
+    else:
+        new_auth = old_pull.auth if old_pull else None
+    # 会话 Cookie 不能当服务间长期凭据: 保存时就拒绝, 让问题在配置阶段暴露,
+    # 而不是等 24 小时会话过期后定时拉取集体 401。
+    if new_auth:
+        from app.services.ext_pull import session_cookie_rejection
+
+        rejected = session_cookie_rejection(new_auth, get_ext_api_key(config_id))
+        if rejected:
+            raise HTTPException(400, rejected)
     config.pull = PullConfig(
         url=body.url,
         method=body.method,
@@ -1025,13 +1040,18 @@ def configure_pull(request: Request, config_id: str, body: PullConfigReq):
         field_map=body.field_map,
         schedule_minutes=body.schedule_minutes,
         enabled=body.enabled,
+        schedule_time=body.schedule_time,
+        schedule_period=body.schedule_period,
+        schedule_day=body.schedule_day,
+        schedule_trading_only=body.schedule_trading_only,
         time_window_start=body.time_window_start,
         time_window_end=body.time_window_end,
         date_param=body.date_param,
         date_format=body.date_format,
         time_field=body.time_field,
-        auth=body.auth.model_dump() if body.auth else (old_pull.auth if old_pull else None),
+        auth=new_auth,
         timeout_seconds=body.timeout_seconds,
+        fanout=body.fanout if body.fanout is not None else (old_pull.fanout if old_pull else None),
         last_run=old_pull.last_run if old_pull else None,
         last_status=old_pull.last_status if old_pull else None,
         last_message=old_pull.last_message if old_pull else None,
@@ -1078,6 +1098,11 @@ def set_pull_api_key(request: Request, config_id: str, body: ApiKeyReq):
 
     value = body.key.strip()
     if value:
+        from app.services.ext_pull import session_cookie_rejection
+
+        rejected = session_cookie_rejection(config.pull.auth if config.pull else None, value)
+        if rejected:
+            raise HTTPException(400, rejected)
         secrets_store.save({ext_api_key_field(config_id): value})
     else:
         secrets_store.clear(ext_api_key_field(config_id))
@@ -1200,6 +1225,65 @@ def fix_symbol(request: Request, config_id: str):
 # ---------------------------------------------------------------------------
 # Schema 发现
 # ---------------------------------------------------------------------------
+
+
+@router.get("/{config_id}/series")
+def ext_series(
+    request: Request,
+    config_id: str,
+    field: str = Query(..., min_length=1, description="数值字段名"),
+    date: str | None = Query(None, description="YYYY-MM-DD, 缺省取最新分区"),
+    symbols: str | None = Query(None, description="逗号分隔标的过滤, 缺省全表"),
+):
+    """日内多盘序列 — 每标的一天的 [HH:MM:SS, value] 点列 (列表迷你图列用)。
+
+    仅 timeseries 且配置了 time_field 的表有意义 (如集合竞价); 其他表 400。
+    value 为 null 的盘点剔除 (折线/柱状不画空点)。symbols 用于按可见页过滤,
+    控制响应体积; 无该日分区时 items 为空 (fail-closed, 不回退他日序列)。
+    """
+    config = _store(request).get(config_id)
+    if not config:
+        raise HTTPException(404, f"配置 '{config_id}' 不存在")
+    time_field = config.pull.time_field if config.pull else None
+    if config.mode != "timeseries" or not time_field:
+        raise HTTPException(400, "仅配置了时间列 (time_field) 的时序扩展表支持序列查询")
+
+    data_dir = _data_dir(request)
+    if date:
+        day = _partition_date(date)
+        path = data_dir / "ext_data" / config_id / "timeseries" / f"date={day}" / "part.parquet"
+        if not path.exists():
+            return {"config_id": config_id, "field": field, "date": day, "items": {}}
+    else:
+        df_all, active = _read_ext_dataframe(config, data_dir)
+        day = active
+        if df_all.is_empty():
+            return {"config_id": config_id, "field": field, "date": day, "items": {}}
+        path = None
+
+    df = pl.read_parquet(path) if path else df_all
+    if df.is_empty() or field not in df.columns or time_field not in df.columns:
+        return {"config_id": config_id, "field": field, "date": day, "items": {}}
+
+    if symbols:
+        wanted = [s.strip() for s in symbols.split(",") if s.strip()]
+        df = df.filter(pl.col("symbol").cast(pl.Utf8).is_in(wanted))
+
+    ts = pl.col(time_field).cast(pl.Utf8)
+    tod = pl.when(ts.str.len_chars() >= 11).then(ts.str.slice(11, 8)).otherwise(ts)
+    points = (
+        df.select(
+            pl.col("symbol").cast(pl.Utf8).alias("symbol"),
+            tod.alias("t"),
+            pl.col(field).cast(pl.Float64).alias("v"),
+        )
+        .filter(pl.col("v").is_not_null() & pl.col("t").is_not_null())
+        .sort(["symbol", "t"])
+    )
+    items: dict[str, list[list[str | float]]] = {}
+    for row in points.select("symbol", "t", "v").iter_rows(named=True):
+        items.setdefault(row["symbol"], []).append([row["t"], float(row["v"])])
+    return {"config_id": config_id, "field": field, "date": day, "items": items}
 
 
 @router.post("/detect-fields")
@@ -1381,6 +1465,9 @@ def discover_all_schemas(request: Request):
             "id": config.id,
             "label": config.label,
             "mode": config.mode,
+            # 日内多盘表的时间列名 (pull.time_field): 前端据此展示「选盘时刻/迷你图」
+            # 列配置; snapshot 表与未配置时间列的表为 null
+            "time_field": (config.pull.time_field if config.pull else None),
             "columns": columns,
         })
     return {"items": result}

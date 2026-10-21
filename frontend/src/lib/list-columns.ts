@@ -30,6 +30,15 @@ export interface ExtColumnDisplayConfig {
   unitConvert?: 'none' | 'wan' | 'yi' | 'auto'
   /** 单位换算后保留小数位(仅 number 类型 + unitConvert≠none 有效), 默认 2 */
   unitDecimals?: number
+  // ── 日内多盘扩展列 (配置了 time_field 的时序表, 如集合竞价) ──
+  /** 选盘时刻 "HH:MM[:SS]": 文字形态取该时刻或之前最近一盘的值; 缺省=末盘 */
+  snapshotAt?: string
+  /** 展示形态: text=文字(选定时刻值), bar=柱状迷你图, line=折线迷你图 (默认 text) */
+  snapshotRender?: 'text' | 'bar' | 'line'
+  /** 迷你图宽度 px (仅 bar/line), 默认 110 */
+  chartWidth?: number
+  /** 迷你图高度 px (仅 bar/line), 默认 36 */
+  chartHeight?: number
 }
 
 /** 日k列渲染配置（builtin: candle 列专用） */
@@ -55,19 +64,58 @@ export const DEFAULT_CANDLE_CONFIG: Required<CandleColumnConfig> = {
   days: 12,
 }
 
+/** 集合竞价叠加配置（分时列专用）。
+ *
+ * 竞价（9:15–9:25）与连续竞价（9:30–15:00）时间轴不重叠，在分时图左侧单独
+ * 开一个窄栏：竞价价格与分时价格共用同一价格纵轴，匹配量/未匹配量以量柱
+ * 画在窄栏底部。三项字段都取自同一张扩展表 —— 它们必须落在同一时间网格上，
+ * 跨表拼接会产生对不齐的点列。
+ */
+/** 竞价窄栏宽度档: 窄/标准/宽 三档 (R3), 持久化于 IntradayAuctionConfig.width */
+export type AuctionBarWidth = 'narrow' | 'standard' | 'wide'
+
+/** 档位→竞价窄栏占整图宽度的比例; 供 MiniIntraday 与测试共用 (测试不再镜像公式) */
+export const AUCTION_WIDTH_RATIOS: Record<AuctionBarWidth, number> = {
+  narrow: 0.20,
+  standard: 0.30,
+  wide: 0.40,
+}
+
+/** 竞价窄栏默认档 (=现状 0.30, 既有视觉与测试零漂移) */
+export const DEFAULT_AUCTION_WIDTH = 'standard' as const
+
+export interface IntradayAuctionConfig {
+  /** 是否显示竞价窄栏 */
+  enabled?: boolean
+  /** 扩展表 id (需 timeseries + 配置了时间列 time_field) */
+  configId?: string
+  /** 竞价价格字段 */
+  priceField?: string
+  /** 匹配量字段 (竞价成交量) */
+  matchField?: string
+  /** 未匹配量字段 (正=买方剩余, 负=卖方剩余) */
+  unmatchedField?: string
+  /** 竞价窄栏宽度档; 缺省/脏值 → 'standard' */
+  width?: AuctionBarWidth
+}
+
 /** 分时列渲染配置（builtin: intraday 列专用） */
 export interface IntradayColumnConfig {
   /** 单元格宽度 px */
   width?: number
   /** 单元格高度 px */
   height?: number
+  /** 成交量副图 (R1): 底部量带 (分钟量柱; 竞价量柱不受此开关控制); 默认 false */
+  volume?: boolean
+  /** 左侧集合竞价叠加 */
+  auction?: IntradayAuctionConfig
 }
 
-/** 分时列配置默认值 */
-export const DEFAULT_INTRADAY_CONFIG: Required<IntradayColumnConfig> = {
+/** 分时列配置默认值（宽高；竞价叠加为可选扩展） */
+export const DEFAULT_INTRADAY_CONFIG = {
   width: 150,
   height: 80,
-}
+} as const
 
 /** 分时列数值边界 */
 const INTRADAY_BOUNDS = {
@@ -75,12 +123,39 @@ const INTRADAY_BOUNDS = {
   height: { min: 32, max: 200 },
 } as const
 
-export function resolveIntradayConfig(cfg: IntradayColumnConfig | undefined): Required<IntradayColumnConfig> {
+export interface ResolvedIntradayConfig {
+  width: number
+  height: number
+  /** c.volume === true 归一 (undefined/脏值 → false) */
+  volume: boolean
+  auction?: IntradayAuctionConfig
+  /** auction.width 归一, 非法值 → 'standard' */
+  auctionWidth: AuctionBarWidth
+}
+
+export function resolveIntradayConfig(cfg: IntradayColumnConfig | undefined): ResolvedIntradayConfig {
   const c = cfg ?? {}
+  const auctionWidth = AUCTION_WIDTH_RATIOS[c.auction?.width as AuctionBarWidth] != null
+    ? c.auction!.width as AuctionBarWidth
+    : DEFAULT_AUCTION_WIDTH
   return {
     width:  clampNum(c.width,  INTRADAY_BOUNDS.width,  DEFAULT_INTRADAY_CONFIG.width),
     height: clampNum(c.height, INTRADAY_BOUNDS.height, DEFAULT_INTRADAY_CONFIG.height),
+    volume: c.volume === true,
+    auction: c.auction,
+    auctionWidth,
   }
+}
+
+/** 竞价叠加是否具备渲染条件（开关 + 扩展表 + 价格字段三者齐全）。 */
+export function isAuctionActive(cfg: IntradayAuctionConfig | undefined): boolean {
+  return !!cfg?.enabled && !!cfg.configId && !!cfg.priceField
+}
+
+/** R2 强制联动判定: 竞价开启且配了匹配量/未匹配量任一字段 → 成交量副图开关在 UI
+ *  上强制置灰为开 (竞价量柱画在量带内, 不受 volume 开关控制)。只配价格字段时自由。 */
+export function hasAuctionVolumeField(cfg: IntradayAuctionConfig | undefined): boolean {
+  return !!cfg?.enabled && !!(cfg.matchField || cfg.unmatchedField)
 }
 
 /** 数值边界（设置过大取上限，过小取最小值） */
@@ -211,11 +286,18 @@ export function mergeColumns(
   return result
 }
 
-/** 从列配置中提取 ext 列参数，用于后端 enriched 接口。 */
+/** 从列配置中提取 ext 列参数，用于后端 enriched 接口。
+
+ *  日内多盘列配置了 snapshotAt 时追加 "@HH:MM[:SS]" 后缀:
+ *  后端取该时刻或之前最近一盘的值 (缺省=末盘)。 */
 export function buildExtColumnsParam(columns: ColumnConfig[]): string {
   return columns
     .filter(c => c.visible && c.source.type === 'ext')
-    .map(c => `${(c.source as { type: 'ext'; configId: string; fieldName: string }).configId}.${(c.source as { type: 'ext'; configId: string; fieldName: string }).fieldName}`)
+    .map(c => {
+      const src = c.source as { type: 'ext'; configId: string; fieldName: string }
+      const at = c.extDisplay?.snapshotAt?.trim()
+      return `${src.configId}.${src.fieldName}${at ? `@${at}` : ''}`
+    })
     .join(',')
 }
 

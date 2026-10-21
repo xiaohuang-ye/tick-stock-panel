@@ -31,8 +31,9 @@ def test_spec_declares_builtin_plugin_fuyao():
     assert "app/plugins/fuyao" in SPEC_CODE
 
 
-def test_spec_declares_builtin_plugin_amber():
-    """amber 插件双声明不被回归 (与 fuyao 同一处理方式)。"""
-    assert "app.plugins.amber.provider" in SPEC_CODE
-    assert "app.plugins.amber.client" in SPEC_CODE
-    assert "app/plugins/amber" in SPEC_CODE
+def test_spec_declares_builtin_plugin_tdx():
+    """tdx 插件双声明不被回归 (与 fuyao 同一处理方式; probe 子进程入口也要可导入)。"""
+    assert "app.plugins.tdxquant.provider" in SPEC_CODE
+    assert "app.plugins.tdxquant.client" in SPEC_CODE
+    assert "app.plugins.tdxquant.probe" in SPEC_CODE
+    assert '"plugins" / "tdxquant" / "plugin.yaml"' in SPEC_CODE  # 源路径必须指向现存目录

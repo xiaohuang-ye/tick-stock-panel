@@ -435,6 +435,38 @@ def get_mainline_filter_config() -> dict:
     }
 
 
+def get_emotion_score_config() -> dict | None:
+    """情绪评分口径配置 (维度权重/子项权重与区间/档位阈值)。
+
+    返回原始 dict 或 None (未自定义 = 用出厂口径)。**不在此处做结构校验与补全** ——
+    合并与归一化统一由 emotion_score.merge_config 负责, 避免两处各写一套默认值而漂移。
+    """
+    v = load().get("emotion_score_config")
+    return v if isinstance(v, dict) else None
+
+
+def set_emotion_score_config(cfg: dict | None) -> dict | None:
+    """保存情绪评分口径。传 None 或 {} = 恢复出厂口径 (清除该键)。
+
+    只做形状校验, 值的合法性 (负数权重/区间倒置/阈值乱序) 由 emotion_score 层
+    在每次计算时归一化 —— 存进去什么由用户负责, 算出来一定安全。
+    """
+    from app.services.emotion_score import merge_config
+
+    if not cfg:
+        with _SAVE_LOCK:
+            current = load()
+            current.pop("emotion_score_config", None)
+            atomic_write_text(_path(), json.dumps(current, indent=2, ensure_ascii=False))
+            _invalidate_cache()
+        return None
+
+    # 落盘前过一遍 merge_config: 校验形状并剔除未知字段, 避免脏配置长期驻留
+    normalized = merge_config(cfg)
+    save({"emotion_score_config": normalized})
+    return normalized
+
+
 def set_mainline_filter_config(cfg: dict) -> dict:
     """保存主线过滤配置(白名单字段, 部分更新)。修改后需重算主线生效。"""
     updates: dict = {}
@@ -619,6 +651,37 @@ def set_review_schedule(enabled: bool, hour: int, minute: int) -> dict:
         h, m = 15, 0
     save({"review_schedule": {"enabled": bool(enabled), "hour": h, "minute": m}})
     return {"enabled": bool(enabled), "hour": h, "minute": m}
+
+
+# 复盘系统提示词长度上限: 默认模板约 2.4k 字符, 留足自定义余量同时防止误存超长文本
+MARKET_RECAP_PROMPT_MAX_CHARS = 32_000
+
+
+def get_market_recap_system_prompt() -> str:
+    """用户自定义的复盘系统提示词。空串 = 未自定义 (market_recap 回退内置默认模板)。"""
+    v = load().get("market_recap_system_prompt")
+    return v.strip() if isinstance(v, str) else ""
+
+
+def set_market_recap_system_prompt(text: str | None) -> str:
+    """保存自定义复盘系统提示词。空串/None = 恢复默认模板 (删除该键)。
+
+    超过 MARKET_RECAP_PROMPT_MAX_CHARS 字符时抛 ValueError, 由 API 层转 400。
+    """
+    cleaned = text.strip() if isinstance(text, str) else ""
+    if not cleaned:
+        with _SAVE_LOCK:
+            current = load()
+            current.pop("market_recap_system_prompt", None)
+            atomic_write_text(_path(), json.dumps(current, indent=2, ensure_ascii=False))
+            _invalidate_cache()
+        return ""
+    if len(cleaned) > MARKET_RECAP_PROMPT_MAX_CHARS:
+        raise ValueError(
+            f"复盘提示词过长 ({len(cleaned)} > {MARKET_RECAP_PROMPT_MAX_CHARS} 字符)"
+        )
+    save({"market_recap_system_prompt": cleaned})
+    return cleaned
 
 
 MINING_BUDGET_PROFILES = frozenset({"balanced", "strict"})
