@@ -33,14 +33,16 @@
 
 | 路径 | 内容 | 说明 |
 | --- | --- | --- |
-| `backend/app/plugins/amber/` | Amber 数据源插件（client/provider/plugin.yaml，约 640 行） | fork 新增数据源 |
-| `backend/app/plugins/stocksdk/` | TickFlow 官方 SDK 桥（`bridge.mjs` + `bridge.py` + provider，约 870 行） | 在"上游简版 provider"上重套管并行桥/限流熔断/脏值守卫 |
-| `backend/app/plugins/zzshare/` | zzshare 免费财务数据插件（provider + requirements） | 财务指标/三大报表 |
+| `backend/app/plugins/amber/` | Amber 数据源插件：`plugin.yaml`、`provider.py`、`client.py`、`__init__.py`（约 640 行） | fork 新增数据源 |
+| `backend/app/plugins/stocksdk/` | TickFlow 官方 SDK 桥：`bridge.mjs`、`bridge.py`、`provider.py`、`plugin.yaml`、`package.json`、`package-lock.json`、`__init__.py`（约 870 行） | 在"上游简版 provider"上重套管并行桥/限流熔断/脏值守卫 |
+| `backend/app/plugins/zzshare/` | zzshare 免费财务数据插件：`provider.py`、`plugin.yaml`、`requirements.txt`、`__init__.py` | 财务指标/三大报表 |
 | `frontend/src/components/data/SyncSymbolsPanel.tsx` | 「按股票同步」面板（调 `/api/kline/sync`） | 配合 `run_symbols_sync` |
+| `frontend/src/pages/Data.tsx` | 数据页接入 `SyncSymbolsPanel`（+23 行） | 同上，入口 UI |
 | `frontend/src/custom/assistant/ui/AiConfigEntry.tsx` | AI 助手配置入口 | fork 的助手 UI 扩展 |
 | `backend/scripts/rebuild_adj_factor.py` | 除权因子重建工具（窗口化重算） | 事故后修复工具 |
 | `scripts/sync-upstream.ps1` | 上游同步脚本（重写检测 + 同步点记录） | 见 `docs/fork-workflow.md` |
 | `start.bat` | Windows 启动脚本 | fork 打包/本地运行 |
+| `docs/fork-patches.md`、`docs/fork-workflow.md` | 本清单与工作流文档 | fork 维护文档 |
 
 ## 三、fork 独有测试（与上面的补丁一一对应，不要删）
 
